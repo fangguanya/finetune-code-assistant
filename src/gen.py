@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # 首先，需要安装 tree-sitter 和相应的语言库
-# pip install tree-sitter
+# pip install tree-sitter==0.21.3
 # 注意：此脚本现在期望 C++ 和 C# 的 tree-sitter 语言库 (.so 或 .dll)
 # 已被编译并放置在指定的路径下 (例如 'build/languages.so|dll')。
 # 它不再尝试自动编译它们。
