@@ -1,20 +1,27 @@
+# -*- coding: utf-8 -*-
 # 首先，需要安装 tree-sitter 和相应的语言库
-# pip install tree-sitter tree-sitter-cpp tree-sitter-csharp
-# 注意：安装 tree-sitter 语言库可能需要 C/C++ 编译器环境
+# pip install tree-sitter
+# 注意：此脚本现在期望 C++ 和 C# 的 tree-sitter 语言库 (.so 或 .dll)
+# 已被编译并放置在指定的路径下 (例如 'build/languages.so|dll')。
+# 它不再尝试自动编译它们。
 
 import asyncio
 import json
 import os
 import random
 import sys
+import logging # <-- Import logging module
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Any
 
 # Tree-sitter imports
 # Ensure tree-sitter is installed: pip install tree-sitter
-# C++/C# language bindings are NOT installed via pip directly,
-# but built locally by this script (requires C compiler and cloned grammars).
-from tree_sitter import Language, Parser
+try:
+    from tree_sitter import Language, Parser
+except ImportError:
+    print("Error: 'tree-sitter' library not found.", file=sys.stderr)
+    print("Please install it using: pip install tree-sitter", file=sys.stderr)
+    sys.exit(1)
 
 # --- 配置常量 ---
 # 定义 C++ 和 C# 的文件扩展名
@@ -35,92 +42,46 @@ OUTPUT_DIR = Path("./cpp_cs_dataset") # 输出目录
 TRAIN_FILENAME = "dataset.train.jsonl"
 TEST_FILENAME = "dataset.test.jsonl"
 
-# --- Tree-sitter Language Loading and Building ---
+# --- Tree-sitter Language Loading ---
+# 此脚本现在 *期望* 语言库文件已经存在于指定路径
 CPP_LANGUAGE: Optional[Language] = None
 CSHARP_LANGUAGE: Optional[Language] = None
 # Determine library extension based on OS
 LIB_EXTENSION = '.dll' if sys.platform == 'win32' else '.so'
-BUILD_LIB_PATH = Path('build') / f'languages{LIB_EXTENSION}'
-VENDOR_DIR = Path('vendor') # Directory to clone grammars into
+# Path where the script expects the pre-compiled shared library
+# 用户需要确保这个文件是通过其他方式编译并放置在这里的
+EXPECTED_LIB_PATH = Path('build') / f'languages{LIB_EXTENSION}'
 
-# Function to locate or build the language library
-def load_or_build_languages():
-    """Loads or builds the Tree-sitter language libraries."""
-    global CPP_LANGUAGE, CSHARP_LANGUAGE
-
-    cpp_grammar_path = VENDOR_DIR / 'tree-sitter-cpp'
-    csharp_grammar_path = VENDOR_DIR / 'tree-sitter-csharp'
-
-    # Create build directory if it doesn't exist
-    BUILD_LIB_PATH.parent.mkdir(exist_ok=True)
-
-    # Check if the library needs to be built or rebuilt
-    needs_build = not BUILD_LIB_PATH.exists()
-    if not needs_build:
-        # Optional: Check if grammar source is newer than the library
-        try:
-            lib_mtime = BUILD_LIB_PATH.stat().st_mtime
-            if cpp_grammar_path.exists() and cpp_grammar_path.stat().st_mtime > lib_mtime:
-                needs_build = True
-            if not needs_build and csharp_grammar_path.exists() and csharp_grammar_path.stat().st_mtime > lib_mtime:
-                needs_build = True
-        except FileNotFoundError:
-            needs_build = True # Grammar source missing, force check/build attempt
-        except Exception as e:
-             print(f"Warning: Could not check modification times ({e}). Assuming build is not needed if library exists.", file=sys.stderr)
-
-
-    if needs_build:
-        print("Attempting to build Tree-sitter languages...", file=sys.stderr)
-        if not cpp_grammar_path.is_dir() or not csharp_grammar_path.is_dir():
-            print(f"\nError: Grammar directories not found in '{VENDOR_DIR}'.", file=sys.stderr)
-            print(f"Please clone the required grammars first:", file=sys.stderr)
-            print(f"  git clone https://github.com/tree-sitter/tree-sitter-cpp {VENDOR_DIR / 'tree-sitter-cpp'}")
-            print(f"  git clone https://github.com/tree-sitter/tree-sitter-csharp {VENDOR_DIR / 'tree-sitter-csharp'}")
-            print(f"\nThen, ensure you have a C/C++ compiler installed and run this script again.", file=sys.stderr)
-            sys.exit(1)
-
-        try:
-            Language.build_library(
-                # Store the library in the build directory
-                str(BUILD_LIB_PATH),
-                # List of paths to grammar repositories
-                [
-                    str(cpp_grammar_path),
-                    str(csharp_grammar_path)
-                ]
-            )
-            print(f"Languages built successfully to '{BUILD_LIB_PATH}'.")
-        except Exception as build_e:
-            print(f"\nError: Failed to build Tree-sitter languages: {build_e}", file=sys.stderr)
-            print("Troubleshooting steps:", file=sys.stderr)
-            print("1. Ensure you have a C/C++ compiler installed (e.g., GCC, Clang, or MSVC Build Tools).", file=sys.stderr)
-            print("2. Make sure the compiler is in your system's PATH.", file=sys.stderr)
-            print(f"3. Verify the grammar repositories exist at the specified paths:", file=sys.stderr)
-            print(f"   - {cpp_grammar_path.resolve()}", file=sys.stderr)
-            print(f"   - {csharp_grammar_path.resolve()}", file=sys.stderr)
-            print("4. Try deleting the 'build' directory and running again.", file=sys.stderr)
-            sys.exit(1)
-
-    # Attempt to load the library
-    try:
-        CPP_LANGUAGE = Language(str(BUILD_LIB_PATH), 'cpp')
-        CSHARP_LANGUAGE = Language(str(BUILD_LIB_PATH), 'csharp')
-        print("Tree-sitter languages loaded successfully.")
-    except Exception as load_e:
-        print(f"\nError: Failed to load Tree-sitter languages from '{BUILD_LIB_PATH}': {load_e}", file=sys.stderr)
-        print("This might indicate an issue with the build process or the compiled library.", file=sys.stderr)
-        sys.exit(1)
-
-
-# Load or build languages when the script starts
-load_or_build_languages()
+# Attempt to load the pre-compiled library
+try:
+    if not EXPECTED_LIB_PATH.exists():
+        raise FileNotFoundError(f"Expected language library not found at: {EXPECTED_LIB_PATH}")
+    CPP_LANGUAGE = Language(str(EXPECTED_LIB_PATH), 'cpp')
+    CSHARP_LANGUAGE = Language(str(EXPECTED_LIB_PATH), 'csharp')
+    print(f"Tree-sitter languages loaded successfully from {EXPECTED_LIB_PATH}.")
+except Exception as load_e:
+    print(f"\nError: Failed to load Tree-sitter languages from '{EXPECTED_LIB_PATH}': {load_e}", file=sys.stderr)
+    print("\nThis script requires a pre-compiled Tree-sitter library containing C++ and C# grammars.", file=sys.stderr)
+    print("Please ensure the following steps are completed:", file=sys.stderr)
+    print("1. You have a C/C++ compiler installed.", file=sys.stderr)
+    print("2. You have cloned the grammar repositories:", file=sys.stderr)
+    print("   git clone https://github.com/tree-sitter/tree-sitter-cpp vendor/tree-sitter-cpp")
+    print("   git clone https://github.com/tree-sitter/tree-sitter-c-sharp vendor/tree-sitter-c-sharp")
+    print(f"3. You have manually built the shared library.")
+    print(f"   IMPORTANT: `Language.build_library` was removed in py-tree-sitter >= 0.22.", file=sys.stderr)
+    print(f"   You MUST use an older version (e.g., 0.21.x) to build the library:", file=sys.stderr)
+    print(f"     pip install \"py-tree-sitter<0.22\"", file=sys.stderr)
+    print(f"   Then run the build command:", file=sys.stderr)
+    print(f"     python -c \"from tree_sitter import Language; Language.build_library('{EXPECTED_LIB_PATH}', ['vendor/tree-sitter-cpp', 'vendor/tree-sitter-c-sharp'])\"", file=sys.stderr)
+    print(f"4. The resulting library file ('{EXPECTED_LIB_PATH.name}') exists at the expected path: '{EXPECTED_LIB_PATH.resolve()}'", file=sys.stderr)
+    print(f"5. You can upgrade py-tree-sitter back to the latest version after building the library if needed.", file=sys.stderr)
+    sys.exit(1)
 
 
 # --- Tree-sitter 解析和节点提取 ---
 
 # 定义我们认为"关键"的 C++ 和 C# 节点类型
-# 这需要根据 tree-sitter-cpp 和 tree-sitter-csharp 的 grammar 来确定
+# 这需要根据 tree-sitter-cpp 和 tree-sitter-c-sharp 的 grammar 来确定
 # 这是一个示例列表，可能需要调整
 CPP_CRITICAL_NODE_TYPES = {
     'function_definition',
@@ -246,6 +207,10 @@ async def process_file(target_file_path: Path, root_dir: Path, train_set_writer,
     language: Optional[Language] = None
     critical_types: set = set()
     lang_name = "unknown"
+
+    # --- Log the file being processed ---
+    logging.info(f"{target_file_path}")
+    # ------------------------------------
 
     if file_ext in CPP_EXTENSIONS:
         language = CPP_LANGUAGE
@@ -398,15 +363,28 @@ async def main(root_dir_str: str):
         print(f"Error: Provided path '{root_dir_str}' is not a valid directory.", file=sys.stderr)
         sys.exit(1)
 
-    # Ensure Tree-sitter languages are loaded (already called globally)
+    # --- Configure Logging ---
+    log_file = OUTPUT_DIR / 'files.log'
+    # Ensure output dir exists for the log file
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(message)s', # Only log the message itself (file path)
+        filename=log_file,
+        filemode='a' # Append mode
+    )
+    # -------------------------
+
+    # Ensure Tree-sitter languages are loaded (already handled globally)
+    # Global variables CPP_LANGUAGE and CSHARP_LANGUAGE are used directly
     if not CPP_LANGUAGE or not CSHARP_LANGUAGE:
-        # The load_or_build function should have exited if loading failed.
-        # This is an extra safeguard.
-        print("Tree-sitter languages not loaded properly. Exiting.", file=sys.stderr)
+         # This should not happen if the initial loading succeeded
+        print("Error: Languages were not loaded correctly.", file=sys.stderr)
         sys.exit(1)
 
-    # Create output directory
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Create output directory (redundant check, already done for logging)
+    # OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     train_file_path = OUTPUT_DIR / TRAIN_FILENAME
     test_file_path = OUTPUT_DIR / TEST_FILENAME
 
@@ -415,26 +393,30 @@ async def main(root_dir_str: str):
     target_files = []
     # Use os.walk for potentially faster/more robust file discovery than rglob on huge trees
     def find_files_sync():
-        """Synchronous function to find files using os.walk."""
+        """Synchronous function to find files using os.walk, skipping specific directories."""
         count = 0
-        for dirpath, _, filenames in os.walk(root_dir):
-             if '.git' in dirpath or 'node_modules' in dirpath: # Basic exclusion
-                 continue
+        # topdown=True allows us to modify dirnames to prune traversal
+        for dirpath, dirnames, filenames in os.walk(root_dir, topdown=True):
+             # Exclude specific directory names (case-sensitive)
+             # Modify dirnames in-place to prevent descending into them
+             if 'ThirdParty' in dirnames:
+                 dirnames.remove('ThirdParty')
+
+             # Also skip common hidden/build directories for efficiency
+             # Note: Modifying dirnames affects further traversal; use list comprehension for current level check
+             dirs_to_skip = {'.git', 'node_modules', 'bin', 'obj', 'Build', 'build', 'Intermediate', 'DerivedDataCache'}
+             dirnames[:] = [d for d in dirnames if d not in dirs_to_skip and not d.startswith('.')] # Filter dirnames for next level
+
+             # Process files in the current directory
              for filename in filenames:
+                 # Check if the file has one of the target extensions
                  file_path = Path(dirpath) / filename
                  if file_path.suffix.lower() in TARGET_EXTENSIONS:
-                     # Basic check if it's likely a text file (optional)
-                     # try:
-                     #    if os.path.getsize(file_path) > 0: # Avoid empty files early
-                     #       with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                     #           f.read(10) # Try reading a bit
-                     #       target_files.append(file_path)
-                     # except Exception:
-                     #    pass # Skip files that can't be read
                      target_files.append(file_path)
                      count += 1
+                     # Optional: Provide progress feedback during scanning
                      if count % 1000 == 0:
-                         print(f"Found {count} files...", end='\r')
+                         print(f"Found {count} files...", end='\\r')
         print() # Newline after scan finish
 
     # Run synchronous file discovery in a thread
@@ -536,6 +518,7 @@ async def main(root_dir_str: str):
     print(f"Total samples generated: {total_samples}")
     print(f"Train samples written to: {train_file_path.resolve()}")
     print(f"Test samples written to: {test_file_path.resolve()}")
+    print(f"Processed file list written to: {log_file.resolve()}") # <-- Inform user about log file
     print(f"Total processing time: {duration:.2f} seconds")
 
 
