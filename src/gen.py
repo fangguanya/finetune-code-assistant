@@ -57,7 +57,7 @@ try:
     if not EXPECTED_LIB_PATH.exists():
         raise FileNotFoundError(f"Expected language library not found at: {EXPECTED_LIB_PATH}")
     CPP_LANGUAGE = Language(str(EXPECTED_LIB_PATH), 'cpp')
-    CSHARP_LANGUAGE = Language(str(EXPECTED_LIB_PATH), 'csharp')
+    CSHARP_LANGUAGE = Language(str(EXPECTED_LIB_PATH), 'c_sharp')
     print(f"Tree-sitter languages loaded successfully from {EXPECTED_LIB_PATH}.")
 except Exception as load_e:
     print(f"\nError: Failed to load Tree-sitter languages from '{EXPECTED_LIB_PATH}': {load_e}", file=sys.stderr)
