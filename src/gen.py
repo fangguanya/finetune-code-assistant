@@ -3,7 +3,7 @@
 # pip install tree-sitter==0.21.3
 # 注意：此脚本现在期望 C++ 和 C# 的 tree-sitter 语言库 (.so 或 .dll)
 # 已被编译并放置在指定的路径下 (例如 'build/languages.so|dll')。
-# 它不再尝试自动编译它们。
+# 或者此脚本会尝试使用旧版 py-tree-sitter (<0.22) 自动编译它们。
 
 import asyncio
 import json
@@ -50,32 +50,134 @@ CSHARP_LANGUAGE: Optional[Language] = None
 LIB_EXTENSION = '.dll' if sys.platform == 'win32' else '.so'
 # Path where the script expects the pre-compiled shared library
 # 用户需要确保这个文件是通过其他方式编译并放置在这里的
-EXPECTED_LIB_PATH = Path('build') / f'languages{LIB_EXTENSION}'
+# EXPECTED_LIB_PATH = Path('build') / f'languages{LIB_EXTENSION}'
+BUILD_LIB_PATH = Path('build') / f'languages{LIB_EXTENSION}'
+VENDOR_DIR = Path('vendor') # Directory to clone grammars into
 
-# Attempt to load the pre-compiled library
-try:
-    if not EXPECTED_LIB_PATH.exists():
-        raise FileNotFoundError(f"Expected language library not found at: {EXPECTED_LIB_PATH}")
-    CPP_LANGUAGE = Language(str(EXPECTED_LIB_PATH), 'cpp')
-    CSHARP_LANGUAGE = Language(str(EXPECTED_LIB_PATH), 'c_sharp')
-    print(f"Tree-sitter languages loaded successfully from {EXPECTED_LIB_PATH}.")
-except Exception as load_e:
-    print(f"\nError: Failed to load Tree-sitter languages from '{EXPECTED_LIB_PATH}': {load_e}", file=sys.stderr)
-    print("\nThis script requires a pre-compiled Tree-sitter library containing C++ and C# grammars.", file=sys.stderr)
-    print("Please ensure the following steps are completed:", file=sys.stderr)
-    print("1. You have a C/C++ compiler installed.", file=sys.stderr)
-    print("2. You have cloned the grammar repositories:", file=sys.stderr)
-    print("   git clone https://github.com/tree-sitter/tree-sitter-cpp vendor/tree-sitter-cpp")
-    print("   git clone https://github.com/tree-sitter/tree-sitter-c-sharp vendor/tree-sitter-c-sharp")
-    print(f"3. You have manually built the shared library.")
-    print(f"   IMPORTANT: `Language.build_library` was removed in py-tree-sitter >= 0.22.", file=sys.stderr)
-    print(f"   You MUST use an older version (e.g., 0.21.x) to build the library:", file=sys.stderr)
-    print(f"     pip install \"py-tree-sitter<0.22\"", file=sys.stderr)
-    print(f"   Then run the build command:", file=sys.stderr)
-    print(f"     python -c \"from tree_sitter import Language; Language.build_library('{EXPECTED_LIB_PATH}', ['vendor/tree-sitter-cpp', 'vendor/tree-sitter-c-sharp'])\"", file=sys.stderr)
-    print(f"4. The resulting library file ('{EXPECTED_LIB_PATH.name}') exists at the expected path: '{EXPECTED_LIB_PATH.resolve()}'", file=sys.stderr)
-    print(f"5. You can upgrade py-tree-sitter back to the latest version after building the library if needed.", file=sys.stderr)
-    sys.exit(1)
+# Function to locate or build the language library
+def load_or_build_languages():
+    """Loads or builds the Tree-sitter language libraries.
+    NOTE: Automatic building requires py-tree-sitter < 0.22
+    """
+    global CPP_LANGUAGE, CSHARP_LANGUAGE
+
+    cpp_grammar_path = VENDOR_DIR / 'tree-sitter-cpp'
+    csharp_grammar_path = VENDOR_DIR / 'tree-sitter-c-sharp' # Corrected name
+
+    # Create build directory if it doesn't exist
+    BUILD_LIB_PATH.parent.mkdir(exist_ok=True)
+
+    # Check if the library needs to be built or rebuilt
+    needs_build = not BUILD_LIB_PATH.exists()
+    if not needs_build:
+        # Optional: Check if grammar source is newer than the library
+        try:
+            lib_mtime = BUILD_LIB_PATH.stat().st_mtime
+            if cpp_grammar_path.exists() and cpp_grammar_path.stat().st_mtime > lib_mtime:
+                needs_build = True
+            if not needs_build and csharp_grammar_path.exists() and csharp_grammar_path.stat().st_mtime > lib_mtime:
+                needs_build = True
+        except FileNotFoundError:
+            needs_build = True # Grammar source missing, force check/build attempt
+        except Exception as e:
+             print(f"Warning: Could not check modification times ({e}). Assuming build is not needed if library exists.", file=sys.stderr)
+
+
+    if needs_build:
+        print("Attempting to build Tree-sitter languages (requires py-tree-sitter < 0.22)...", file=sys.stderr)
+
+        # --- Check and clone missing grammar repositories ---
+        clone_commands = []
+        if not cpp_grammar_path.is_dir():
+            print(f"Directory not found: {cpp_grammar_path}. Will attempt to clone.", file=sys.stderr)
+            VENDOR_DIR.mkdir(parents=True, exist_ok=True) # Ensure vendor dir exists
+            clone_commands.append(f"git clone https://github.com/tree-sitter/tree-sitter-cpp {cpp_grammar_path}")
+        if not csharp_grammar_path.is_dir():
+            print(f"Directory not found: {csharp_grammar_path}. Will attempt to clone.", file=sys.stderr)
+            VENDOR_DIR.mkdir(parents=True, exist_ok=True) # Ensure vendor dir exists
+            clone_commands.append(f"git clone https://github.com/tree-sitter/tree-sitter-c-sharp {csharp_grammar_path}")
+
+        # Run clone commands if any are needed
+        # Note: This part needs to be handled outside the Python script execution flow
+        # by calling the run_terminal_cmd tool sequentially based on clone_commands.
+        # The script below will prepare the commands.
+
+        # We need to exit here and let the user/environment run the clone commands.
+        # The next run of the script should find the directories.
+        if clone_commands:
+             print("\nError: Required grammar repositories missing.", file=sys.stderr)
+             print("Please run the following commands in your terminal:", file=sys.stderr)
+             for cmd in clone_commands:
+                 print(f"  {cmd}", file=sys.stderr)
+             print("\nThen re-run this script.", file=sys.stderr)
+             # We cannot directly execute terminal commands from here that block the build.
+             # The user needs to run them manually or the calling environment needs to handle it.
+             sys.exit(1)
+        # --- End check and clone ---
+
+
+        # # Original check (now redundant if clone logic is handled externally)
+        # if not cpp_grammar_path.is_dir() or not csharp_grammar_path.is_dir():
+        #     print(f"\\nError: Grammar directories not found in '{VENDOR_DIR}'.", file=sys.stderr)
+        #     print(f"Please clone the required grammars first:", file=sys.stderr)
+        #     print(f"  git clone https://github.com/tree-sitter/tree-sitter-cpp {VENDOR_DIR / 'tree-sitter-cpp'}")
+        #     print(f"  git clone https://github.com/tree-sitter/tree-sitter-c-sharp {VENDOR_DIR / 'tree-sitter-c-sharp'}")
+        #     print(f"\\nThen, ensure you have a C/C++ compiler installed and run this script again.", file=sys.stderr)
+        #     sys.exit(1)
+
+        try:
+            # --- This is the part that requires py-tree-sitter < 0.22 ---
+            if not hasattr(Language, 'build_library'):
+                raise AttributeError("Language.build_library not found. You might need py-tree-sitter < 0.22 to build automatically.")
+            
+            Language.build_library(
+                # Store the library in the build directory
+                str(BUILD_LIB_PATH),
+                # List of paths to grammar repositories
+                [
+                    str(cpp_grammar_path),
+                    str(csharp_grammar_path)
+                ]
+            )
+            # -----------------------------------------------------------
+            print(f"Languages built successfully to '{BUILD_LIB_PATH}'.")
+        except AttributeError as attr_err:
+            print(f"\nError: {attr_err}", file=sys.stderr)
+            print("Automatic building failed. This script version requires Language.build_library.", file=sys.stderr)
+            print("Please either install an older version of the library (pip install \"py-tree-sitter<0.22\")", file=sys.stderr)
+            print("OR manually compile the library and place it at:", BUILD_LIB_PATH, file=sys.stderr)
+            sys.exit(1)
+        except Exception as build_e:
+            print(f"\nError: Failed to build Tree-sitter languages: {build_e}", file=sys.stderr)
+            print("Troubleshooting steps:", file=sys.stderr)
+            print("1. Ensure you have a C/C++ compiler installed (e.g., GCC, Clang, or MSVC Build Tools).", file=sys.stderr)
+            print("2. Make sure the compiler is in your system's PATH.", file=sys.stderr)
+            print(f"3. Verify the grammar repositories exist at the specified paths:", file=sys.stderr)
+            print(f"   - {cpp_grammar_path.resolve()}", file=sys.stderr)
+            print(f"   - {csharp_grammar_path.resolve()}", file=sys.stderr)
+            print("4. Try deleting the 'build' directory and running again.", file=sys.stderr)
+            sys.exit(1)
+
+    # Attempt to load the library (whether pre-existing or just built)
+    try:
+        CPP_LANGUAGE = Language(str(BUILD_LIB_PATH), 'cpp')
+        # Corrected symbol name for C# is 'c_sharp' or potentially just 'csharp' depending on build/version
+        # Let's try 'c_sharp' first as it aligns with repo name somewhat
+        try:
+             CSHARP_LANGUAGE = Language(str(BUILD_LIB_PATH), 'c_sharp')
+        except ValueError:
+             print("Warning: Could not load C# language with symbol 'c_sharp', trying 'csharp'...", file=sys.stderr)
+             CSHARP_LANGUAGE = Language(str(BUILD_LIB_PATH), 'csharp') 
+
+        print(f"Tree-sitter languages loaded successfully from {BUILD_LIB_PATH}.")
+    except Exception as load_e:
+        print(f"\nError: Failed to load Tree-sitter languages from '{BUILD_LIB_PATH}': {load_e}", file=sys.stderr)
+        print("This might indicate an issue with the build process or the compiled library itself.", file=sys.stderr)
+        print(f"Ensure the file exists and is a valid library for your system:", BUILD_LIB_PATH.resolve(), file=sys.stderr)
+        sys.exit(1)
+
+# Load or build languages when the script starts
+load_or_build_languages()
 
 
 # --- Tree-sitter 解析和节点提取 ---
