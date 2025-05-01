@@ -41,6 +41,8 @@ TRAIN_TEST_SPLIT_RATIO = 0.98 # 训练集比例
 OUTPUT_DIR = Path("./cpp_cs_dataset") # 输出目录
 TRAIN_FILENAME = "dataset.train.jsonl"
 TEST_FILENAME = "dataset.test.jsonl"
+FILES_LOG_FILENAME = "files.log" # Log processed files
+IGNORES_LOG_FILENAME = "ignores.log" # Log skipped directories
 
 # --- Tree-sitter Language Loading ---
 # 此脚本现在 *期望* 语言库文件已经存在于指定路径
@@ -465,15 +467,17 @@ async def main(root_dir_str: str):
         print(f"Error: Provided path '{root_dir_str}' is not a valid directory.", file=sys.stderr)
         sys.exit(1)
 
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True) # Ensure output dir exists first
+
     # --- Configure Logging ---
-    log_file = OUTPUT_DIR / 'files.log'
-    # Ensure output dir exists for the log file
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    files_log_path = OUTPUT_DIR / FILES_LOG_FILENAME
+    ignores_log_path = OUTPUT_DIR / IGNORES_LOG_FILENAME # Path for ignore log
+
     logging.basicConfig(
         level=logging.INFO,
         format='%(message)s', # Only log the message itself (file path)
-        filename=log_file,
-        filemode='a' # Append mode
+        filename=files_log_path,
+        filemode='w' # Changed from 'a' to 'w' for overwrite mode
     )
     # -------------------------
 
@@ -493,35 +497,69 @@ async def main(root_dir_str: str):
     # --- File Discovery ---
     print(f"Scanning for {', '.join(TARGET_EXTENSIONS)} files in {root_dir}...")
     target_files = []
-    # Use os.walk for potentially faster/more robust file discovery than rglob on huge trees
+
     def find_files_sync():
-        """Synchronous function to find files using os.walk, skipping specific directories."""
         count = 0
-        # topdown=True allows us to modify dirnames to prune traversal
-        for dirpath, dirnames, filenames in os.walk(root_dir, topdown=True):
-             # Exclude specific directory names (case-sensitive)
-             # Modify dirnames in-place to prevent descending into them
-             if 'ThirdParty' in dirnames:
-                 dirnames.remove('ThirdParty')
+        dirs_to_skip_specific = {'ThirdParty', 'Extras', 'thirdparty'}
+        dirs_to_skip_generic = {'.git', 'node_modules', 'bin', 'obj', 'Build', 'build', 'Intermediate', 'DerivedDataCache'}
+        try:
+             # Open ignores log in write/overwrite mode ('w') within the function
+             with open(ignores_log_path, 'w', encoding='utf-8') as ignores_log_file:
+                 # Write header inside the with block
+                 ignores_log_file.write(f"# Skipped directories during scan of: {root_dir}\n")
+                 for dirpath, dirnames, filenames in os.walk(root_dir, topdown=True):
+                     current_dir_path = Path(dirpath)
+                     dirs_to_remove = set()
 
-             # Also skip common hidden/build directories for efficiency
-             # Note: Modifying dirnames affects further traversal; use list comprehension for current level check
-             dirs_to_skip = {'.git', 'node_modules', 'bin', 'obj', 'Build', 'build', 'Intermediate', 'DerivedDataCache'}
-             dirnames[:] = [d for d in dirnames if d not in dirs_to_skip and not d.startswith('.')] # Filter dirnames for next level
+                     # Check and log directories to be skipped
+                     for d in dirnames:
+                         skip = False
+                         if d in dirs_to_skip_specific or d in dirs_to_skip_generic or d.startswith('.'):
+                             skip = True
 
-             # Process files in the current directory
-             for filename in filenames:
-                 # Check if the file has one of the target extensions
-                 file_path = Path(dirpath) / filename
-                 if file_path.suffix.lower() in TARGET_EXTENSIONS:
-                     target_files.append(file_path)
-                     count += 1
-                     # Optional: Provide progress feedback during scanning
-                     if count % 1000 == 0:
-                         print(f"Found {count} files...", end='\\r')
-        print() # Newline after scan finish
+                         if skip:
+                             full_skip_path = current_dir_path / d
+                             ignores_log_file.write(f"{full_skip_path.as_posix()}\n") # Log path
+                             dirs_to_remove.add(d)
 
-    # Run synchronous file discovery in a thread
+                     # Prune dirnames *after* logging potential skips
+                     if dirs_to_remove:
+                         dirnames[:] = [d for d in dirnames if d not in dirs_to_remove]
+
+                     # Process files in the current directory
+                     for filename in filenames:
+                         # Remove file-level skip for 'thirdparty' for simplicity, focus on dirs
+                         file_path = current_dir_path / filename
+                         if file_path.suffix.lower() in TARGET_EXTENSIONS:
+                             target_files.append(file_path)
+                             count += 1
+                             if count % 1000 == 0:
+                                 print(f"Found {count} files...", end='\r')
+        except OSError as e:
+             print(f"Warning: Error writing to ignores log file '{ignores_log_path}': {e}. Ignore logging stopped.", file=sys.stderr)
+             # Continue scan without ignore logging
+             # Need to replicate the walk logic without logging if the file fails mid-way, or just let it fail.
+             # For simplicity, we'll let it stop logging ignores but continue scanning files.
+             # Re-implement walk without the 'with open' context:
+             for dirpath, dirnames, filenames in os.walk(root_dir, topdown=True):
+                 current_dir_path = Path(dirpath)
+                 dirs_to_remove = set()
+                 for d in dirnames:
+                     if d in dirs_to_skip_specific or d in dirs_to_skip_generic or d.startswith('.'):
+                         dirs_to_remove.add(d)
+                 if dirs_to_remove: dirnames[:] = [d for d in dirnames if d not in dirs_to_remove]
+
+                 for filename in filenames:
+                      file_path = current_dir_path / filename
+                      if file_path.suffix.lower() in TARGET_EXTENSIONS:
+                          target_files.append(file_path)
+                          count += 1 # Continue counting
+                          if count % 1000 == 0: print(f"Found {count} files...", end='\r')
+
+        finally:
+             print() # Newline after scan finish / progress indicator
+
+
     await asyncio.to_thread(find_files_sync)
 
     if not target_files:
@@ -620,7 +658,8 @@ async def main(root_dir_str: str):
     print(f"Total samples generated: {total_samples}")
     print(f"Train samples written to: {train_file_path.resolve()}")
     print(f"Test samples written to: {test_file_path.resolve()}")
-    print(f"Processed file list written to: {log_file.resolve()}") # <-- Inform user about log file
+    print(f"Processed file list written to: {files_log_path.resolve()}") # <-- Inform user about log file
+    print(f"Skipped directory list written to: {ignores_log_path.resolve()}") # <-- Inform about ignores log
     print(f"Total processing time: {duration:.2f} seconds")
 
 
