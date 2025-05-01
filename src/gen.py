@@ -10,7 +10,7 @@ from typing import List, Dict, Tuple, Optional, Any
 # Tree-sitter imports
 # Ensure tree-sitter is installed: pip install tree-sitter
 try:
-    from tree_sitter import Language, Parser
+    from tree_sitter import Language, Parser, Node
 except ImportError:
     # Cannot use logging here as it's not configured yet
     print("Fatal: 'tree-sitter' library not found.", file=sys.stderr)
@@ -177,14 +177,28 @@ def get_critical_nodes_from_tree(node, file_content_bytes: bytes, critical_types
     if is_critical and is_within_span:
         nodes.append({'start': node.start_byte, 'end': node.end_byte})
     elif node.type == 'ERROR':
-         logging.debug(f"Encountered ERROR node type at bytes {node.start_byte}-{node.end_byte}, stopping recursion here.")
-         return nodes # Stop recursion into error nodes
+         logging.debug(f"Skipping ERROR node at bytes {node.start_byte}-{node.end_byte}")
+         return nodes # Stop recursion into error nodes to avoid extracting them
 
     for child in node.children:
         if child.start_byte >= node.start_byte and child.end_byte <= node.end_byte and child != node:
              nodes.extend(get_critical_nodes_from_tree(child, file_content_bytes, critical_types, min_span, max_span))
     return nodes
 
+def log_parse_errors(node: Node, file_path: Path):
+    """Recursively finds and logs ERROR nodes in the syntax tree."""
+    if node.type == 'ERROR':
+        start_line, start_col = node.start_point
+        end_line, end_col = node.end_point
+        error_text_snippet = node.text.decode('utf-8', errors='replace')[:100] # Get first 100 chars
+        logging.warning(
+            f"Parse ERROR node found in {file_path} at "
+            f"L{start_line+1}:C{start_col+1} - L{end_line+1}:C{end_col+1}. "
+            f"Snippet: '{error_text_snippet}...'"
+        )
+    # Recurse into children regardless of current node type to find all errors
+    for child in node.children:
+        log_parse_errors(child, file_path)
 
 def extract_critical_blocks_cpp_cs(file_path: Path, file_contents: str, language: Language, critical_types: set) -> List[Dict[str, int]]:
     """使用 Tree-sitter 解析 C++/C# 文件并提取关键块"""
@@ -205,13 +219,24 @@ def extract_critical_blocks_cpp_cs(file_path: Path, file_contents: str, language
              logging.warning(f"Tree-sitter parsing timed out for file: {file_path}")
              return []
     except Exception as e:
-        logging.error(f"Tree-sitter parsing error for file {file_path}: {e}", exc_info=True)
-        return [] # 解析失败返回空
+        logging.error(f"Tree-sitter parsing failed with exception for file {file_path}: {e}", exc_info=True)
+        return []
 
-    root_node = tree.root_node
-    if not root_node or root_node.has_error():
+    root_node = tree.root_node if tree else None
+
+    # Check if parsing failed fundamentally or resulted in errors
+    if not root_node or root_node.has_error:
         logging.warning(f"Parsing resulted in errors or empty tree for file: {file_path}")
-        # Optionally log specific errors if needed: traverse for ERROR nodes
+        if root_node and root_node.has_error:
+            # If there's a root node but it contains errors, log the details
+            try:
+                log_parse_errors(root_node, file_path)
+            except Exception as log_err:
+                 logging.error(f"Failed to log detailed parse errors for {file_path}: {log_err}", exc_info=True)
+        # Decide if we should still try to extract nodes or return early
+        # For now, return early if root_node is None or has errors at the root level.
+        # You might want to proceed even with errors depending on robustness needs.
+        return [] # Return empty list as the parse wasn't clean
 
     file_len = len(file_content_bytes)
     max_node_span_calc = max(MIN_MAX_NODE_SPAN, int(file_len * MAX_NODE_SPAN_RATIO))
