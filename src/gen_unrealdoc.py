@@ -161,80 +161,106 @@ def clean_comment(raw_comment: str) -> str:
     return "\n".join(cleaned_lines[start_index:end_index+1])
 
 def find_leading_comment(node: Optional[Node], content_bytes: bytes) -> Optional[str]:
-    """Finds the immediately preceding comment for a given node.
-    Iterates backwards through siblings of the parent node.
     """
-    if not node or not node.parent: # Need parent to find siblings
-        return None
+    Finds preceding comment(s) for a given node.
+    Iterates backwards through siblings, accumulating consecutive comment blocks
+    separated by at most `max_lines_gap_between_comments`.
+    Stops if a non-comment named node is encountered or the gap to the code
+    or between comments becomes too large.
+    """
+    if not node or not node.parent: return None
 
-    comment_text: Optional[str] = None
-    max_lines_gap = 2 # Maximum blank lines allowed between comment and node
+    comment_blocks: List[str] = [] # Stores cleaned text of consecutive blocks, in reverse file order
+    last_comment_block_end_line = -1 # End line of the comment block closest to the code node found so far
+    first_comment_block_start_line = -1 # Start line of the earliest comment block found in the sequence
+
+    max_lines_gap_between_comments = 1 # Max 1 blank line between consecutive comments
+    max_lines_gap_to_code = 2        # Max 2 blank lines between last comment and code
     target_start_line = node.start_point[0]
     parent = node.parent
     target_node_index = -1
 
-    # Find the index of the target node among its siblings
+    # Find the index of the target node
     try:
-        siblings = parent.children # Use children to include unnamed nodes like comments
+        siblings = parent.children
         for i, sibling in enumerate(siblings):
-            # Compare nodes by properties for robustness
+            # Robust node comparison
             if sibling.start_byte == node.start_byte and sibling.end_byte == node.end_byte and sibling.type == node.type:
                  target_node_index = i
                  break
     except Exception as e:
-         # Log the error but avoid crashing the entire process
          logging.error(f"Error finding node index within parent (node type: {node.type}, parent type: {parent.type}): {e}", exc_info=True)
-         return None # Cannot proceed without index
-
+         return None
     if target_node_index == -1:
-         # It's possible the node doesn't exist directly in parent.children in some edge cases
-         # or if the tree structure is unexpected.
          logging.debug(f"Could not find the target node (type: {node.type}, line: {target_start_line + 1}) within its parent's ({parent.type}) children list.")
          return None
 
     # Iterate backwards from the node *before* the target node
     for i in range(target_node_index - 1, -1, -1):
         prev_sibling = siblings[i]
+        prev_sibling_start_line = prev_sibling.start_point[0]
+        prev_sibling_end_line = prev_sibling.end_point[0]
 
-        # Check if the sibling ends before the target starts (safety check)
-        if prev_sibling.end_point[0] > target_start_line:
-            # This might happen if nodes are improperly ordered or overlap, skip it
-            logging.debug(f"Skipping sibling {prev_sibling.type} ending at {prev_sibling.end_point[0]+1} which is after target start {target_start_line+1}")
+        is_comment_node = prev_sibling.type == 'comment'
+
+        # Calculate gap to the *next* element (code node or start of previously found comment block)
+        # The "next" element is the one closer to the code in the file.
+        gap_reference_start_line = target_start_line if last_comment_block_end_line == -1 else first_comment_block_start_line
+        # Gap = start line of next element - end line of current element
+        gap_to_next_element = gap_reference_start_line - prev_sibling_end_line
+
+        # Determine the maximum allowed gap for this specific step
+        # If we haven't found any comments yet, use gap_to_code, otherwise use gap_between_comments
+        max_allowed_gap = max_lines_gap_to_code if last_comment_block_end_line == -1 else max_lines_gap_between_comments
+
+        # Check gap condition: (gap lines = difference - 1). So difference > max_gap + 1 means too many lines.
+        if gap_to_next_element > max_allowed_gap + 1:
+             logging.debug(f"Stopping comment accumulation for node at L{target_start_line + 1}: Gap ({gap_to_next_element} lines) between sibling ending L{prev_sibling_end_line + 1} and next element starting L{gap_reference_start_line + 1} exceeds max allowed ({max_allowed_gap}).")
+             break # Gap too large, stop searching further back
+
+        # Now process the node type if the gap is acceptable
+        if is_comment_node:
+            raw_comment = get_text(prev_sibling, content_bytes)
+            cleaned = clean_comment(raw_comment)
+            if cleaned:
+                comment_blocks.append(cleaned) # Add block text (will be reversed later)
+                if last_comment_block_end_line == -1: # Record end line of the first comment found (closest to code)
+                    last_comment_block_end_line = prev_sibling_end_line
+                first_comment_block_start_line = prev_sibling_start_line # Update start line of the overall comment sequence
+                logging.debug(f"Accumulated comment block ending at L{prev_sibling_end_line + 1}")
+                # Continue the loop to check for more comments further back
+            else:
+                # Empty comment block. Treat it like whitespace. If it causes the gap check
+                # above to fail on the *next* iteration when checking the node before it, the sequence breaks naturally.
+                logging.debug(f"Ignoring empty comment block ending at L{prev_sibling_end_line + 1}")
+                continue # Continue searching past the empty comment
+
+        elif prev_sibling.is_named:
+            # Hit a significant non-comment node, stop searching further back.
+            logging.debug(f"Stopping comment accumulation for node at L{target_start_line + 1}: Encountered non-comment named node '{prev_sibling.type}' ending at L{prev_sibling_end_line + 1}.")
+            break
+        else:
+            # Unnamed node (e.g., punctuation, whitespace). Treat like whitespace. The gap check
+            # handles stopping if it creates too much distance.
             continue
 
-        line_diff = target_start_line - prev_sibling.end_point[0]
+    # --- Post-loop processing ---
+    if not comment_blocks:
+        return None # No comments found
 
-        # Check if the gap is too large (and node is not adjacent on the same line)
-        if line_diff > max_lines_gap:
-            logging.debug(f"Stopping comment search for node at line {target_start_line + 1}: previous sibling ({prev_sibling.type}) at line {prev_sibling.end_point[0] + 1} is too far (gap > {max_lines_gap}).")
-            break # Gap too large, stop searching
+    # Final check: Ensure the gap between the last comment found (closest to code)
+    # and the code itself is acceptable. This *should* be implicitly handled
+    # by the first iteration's gap check (when last_comment_block_end_line == -1),
+    # but double-checking adds robustness.
+    final_gap_to_code = target_start_line - last_comment_block_end_line
+    if final_gap_to_code > max_lines_gap_to_code + 1:
+         logging.debug(f"Discarding accumulated comments for node at L{target_start_line + 1}: Final gap ({final_gap_to_code} lines) between last comment (ends L{last_comment_block_end_line + 1}) and code exceeds max ({max_lines_gap_to_code}).")
+         return None
 
-        # Check if this sibling is a comment. Comments are typically named nodes in most grammars.
-        if prev_sibling.type == 'comment': # Directly check type, assume comments are 'comment' type
-            raw_comment = get_text(prev_sibling, content_bytes)
-            # Check if the comment content is non-empty after cleaning before assigning
-            cleaned = clean_comment(raw_comment)
-            if cleaned: # Only assign if there's actual content
-                 comment_text = cleaned
-                 logging.debug(f"Found comment for node at line {target_start_line + 1} ending at line {prev_sibling.end_point[0] + 1}.")
-                 break # Found the closest preceding comment
-            else:
-                 # Found an empty comment, continue searching further back
-                 logging.debug(f"Found empty comment block before node at line {target_start_line + 1}, continuing search.")
-                 continue
-
-        # If the previous sibling is *named* and *not* a comment, stop searching.
-        # This prevents associating comments across unrelated code blocks.
-        # Unnamed nodes (like punctuation ';', '{', '}') shouldn't block the search
-        # unless they cause a large line gap (handled above).
-        elif prev_sibling.is_named and prev_sibling.type != 'comment':
-             logging.debug(f"Stopping comment search for node at line {target_start_line + 1}: encountered non-comment named node '{prev_sibling.type}' at line {prev_sibling.start_point[0] + 1}.")
-             break # Hit a significant code element, stop
-
-        # If it's not a comment and not a named node (e.g., punctuation), continue searching backwards.
-        # The line gap check will eventually stop the loop if needed.
-
-    return comment_text
+    # Join the blocks in the correct file order (reverse of accumulation)
+    # Use double newline to visually separate distinct comment blocks (e.g., a /* */ followed by //)
+    full_comment = "\n\n".join(reversed(comment_blocks))
+    return full_comment
 
 def find_child_by_type(node: Optional[Node], type_name: str) -> Optional[Node]:
     """Find the first direct child node of a specific type."""
