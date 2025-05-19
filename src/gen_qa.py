@@ -133,7 +133,7 @@ def extract_cpp_elements(file_path, compiler_args=None):
 
     elements = []
     if compiler_args is None:
-        compiler_args = ['-std=c++11'] # Default, can be overridden
+        compiler_args = ['-std=c++20'] # Default, can be overridden
 
     try:
         index = Index.create()
@@ -390,7 +390,7 @@ def generate_sft_data(elements, min_complexity_score):
 def main():
     parser = argparse.ArgumentParser(description="Scan C++/C# source files, analyze complexity, and generate SFT data.")
     parser.add_argument("source_directory", type=str, help="The root directory of the source code to scan.")
-    parser.add_argument("-o", "--output_file", type=str, default="sft_dataset.jsonl", help="The output file for SFT data (JSON Lines format).")
+    parser.add_argument("-o", "--output_file", type=str, default="sft_dataset.json", help="The output file for SFT data (JSON Lines format).")
     parser.add_argument("-m", "--min_complexity", type=float, default=10.0, help="Minimum complexity score for a code element to be included in the SFT dataset.")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output.")
     parser.add_argument("--cpp_compiler_args", type=str, help="Comma-separated compiler arguments for C++ parsing (e.g., '-std=c++17,-Iinclude').")
@@ -411,66 +411,119 @@ def main():
     if args.verbose:
         print(f"Found {len(source_files['cpp'])} C++ files and {len(source_files['csharp'])} C# files.")
 
-    all_elements = []
-    
-    cpp_args = []
     if args.cpp_compiler_args:
         cpp_args = args.cpp_compiler_args.split(',')
         if args.verbose:
             print(f"Using C++ compiler arguments: {cpp_args}")
+    else:
+        cpp_args = ['-std=c++20']
 
-    for lang, files in source_files.items():
-        extractor = None
-        if lang == 'cpp':
-            if LIBCLANG_AVAILABLE:
-                if args.verbose:
-                    print("Using libclang (AST-based) for C++ files.")
-                # Pass compiler args to the C++ extractor
-                extractor = lambda f: extract_cpp_elements(f, compiler_args=cpp_args)
-            else:
-                if args.verbose:
-                    print("Warning: libclang not found, C++ processing will be skipped or use a fallback (currently skips).")
-                # Here you could fall back to the old regex version if desired
-                # from functools import partial
-                # extractor = extract_cpp_elements_regex_fallback 
-                # For now, we just skip if libclang is not there.
-                continue 
-        elif lang == 'csharp':
-            if args.verbose:
-                print("Using regex-based extraction for C# files.")
-            extractor = extract_csharp_elements # Stays regex-based
-        
-        if extractor:
-            count = 0
-            for file_path in files:
-                if args.verbose:
-                    print(f"Processing {lang.upper()} file: {file_path}")
-                elements = extractor(file_path)
-                if elements:
-                    all_elements.extend(elements)
-                    count += len(elements)
-            if args.verbose:
-                print(f"Extracted {count} elements from {lang.upper()} files.")
-    
-    if args.verbose:
-        print(f"Total elements extracted before filtering: {len(all_elements)}")
+    # --- Re-add Progress Bar Logic ---
+    total_files_to_process = len(source_files['cpp']) + len(source_files['csharp'])
+    processed_files_count = 0
 
-    sft_data = generate_sft_data(all_elements, args.min_complexity)
+    def print_progress(processed, total, file_name=""):
+        percentage = (processed / total) * 100 if total > 0 else 0
+        bar_length = 40
+        filled_length = int(bar_length * processed // total) if total > 0 else 0
+        bar = '█' * filled_length + '-' * (bar_length - filled_length)
+        status_line = f'Progress: |{bar}| {percentage:.2f}% ({processed}/{total}) Processing: {file_name[:50]:<50}'
+        print(f'\r{status_line}', end='')
+        if processed == total:
+            print() # Newline at the end
 
-    if args.verbose:
-        print(f"Generated {len(sft_data)} SFT records meeting the complexity threshold.")
+    if total_files_to_process == 0:
+        if args.verbose:
+            print("No source files found to process.")
+        # Create an empty JSON array if no files
+        try:
+            with open(args.output_file, 'w', encoding='utf-8') as f:
+                f.write("[]")
+            print(f"SFT dataset successfully saved to {args.output_file} (empty as no files were processed).")
+        except IOError as e:
+            print(f"Error writing empty output file {args.output_file}: {e}")
+        return # Exit early if no files
+    # --- End Progress Bar Logic ---
 
+    # --- Streaming JSON Output Logic ---
+    first_record_written_to_file = False
     try:
-        with open(args.output_file, 'w', encoding='utf-8') as f:
-            json.dump(sft_data, f)
-            # content = json.dumps(sft_data)
-            # f.write(content)
-            # json.dumps(sft_data, ensure_ascii=False, indent=2)
-            # for record in sft_data:
-                # f.write(json.dumps(record, ensure_ascii=False) + '\\n')
-        print(f"SFT dataset successfully saved to {args.output_file}")
+        with open(args.output_file, 'w', encoding='utf-8') as outfile:
+            outfile.write("[") # Start of the JSON array
+
+            for lang, files in source_files.items():
+                extractor = None
+                if lang == 'cpp':
+                    if LIBCLANG_AVAILABLE:
+                        if args.verbose:
+                            print("Using libclang (AST-based) for C++ files.")
+                        extractor = lambda f: extract_cpp_elements(f, compiler_args=cpp_args)
+                    else:
+                        if args.verbose:
+                            print("Warning: libclang not found, C++ processing will be skipped.")
+                        # Increment count for skipped files for progress bar accuracy
+                        processed_files_count += len(files) 
+                        print_progress(processed_files_count, total_files_to_process, "Skipping C++ files")
+                        continue 
+                elif lang == 'csharp':
+                    if args.verbose:
+                        print("Using regex-based extraction for C# files.")
+                    extractor = extract_csharp_elements
+                
+                if not extractor:
+                    # Should not happen if lang is cpp or csharp, but as a safeguard
+                    processed_files_count += len(files)
+                    print_progress(processed_files_count, total_files_to_process, f"Skipping {lang} files (no extractor)")
+                    continue
+
+                for file_path in files:
+                    current_file_name = os.path.basename(file_path)
+                    if args.verbose:
+                        # Verbose mode: print which file it's processing BEFORE the progress bar update for this file
+                        print(f"\nProcessing {lang.upper()} file: {file_path}") 
+                        print_progress(processed_files_count, total_files_to_process, current_file_name)
+                    else:
+                        # Non-verbose: update progress bar with current file being processed
+                        print_progress(processed_files_count, total_files_to_process, current_file_name)
+                    
+                    file_elements = extractor(file_path)
+                    
+                    if file_elements:
+                        # Generate SFT data only for elements from the current file
+                        sft_data_for_file = generate_sft_data(file_elements, args.min_complexity)
+                        
+                        for record in sft_data_for_file:
+                            if first_record_written_to_file:
+                                outfile.write(",\n") # Add comma and newline for readability
+                            else:
+                                outfile.write("\n") # Add newline for first record for readability
+                            
+                            json.dump(record, outfile, ensure_ascii=False, indent=2 if args.verbose else None)
+                            first_record_written_to_file = True
+                    
+                    processed_files_count += 1
+                    # Update progress after processing the file
+                    if args.verbose:
+                        # For verbose, the progress bar might have already been updated before detailed processing print
+                        # So, ensure it reflects the count correctly after processing.
+                        print_progress(processed_files_count, total_files_to_process, current_file_name) 
+                    else:
+                        print_progress(processed_files_count, total_files_to_process, current_file_name)
+
+            if first_record_written_to_file: # if any record was written, add a final newline before closing bracket
+                 outfile.write("\n")
+            outfile.write("]") # End of the JSON array
+        
+        print(f"\nSFT dataset successfully saved to {args.output_file}")
+
     except IOError as e:
-        print(f"Error writing output file {args.output_file}: {e}")
+        print(f"\nError during file processing or writing output file {args.output_file}: {e}")
+    # --- End Streaming JSON Output Logic ---
+
+    # Removed old block processing and writing logic
+    # all_elements = [] ...
+    # sft_data = generate_sft_data(all_elements, args.min_complexity) ...
+    # try: with open(args.output_file, 'w', encoding='utf-8') as f: json.dump(sft_data, f) ...
 
 if __name__ == "__main__":
     main()
