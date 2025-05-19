@@ -416,7 +416,7 @@ def main():
         if args.verbose:
             print(f"Using C++ compiler arguments: {cpp_args}")
     else:
-        cpp_args = ['-std=c++20']
+        cpp_args = ['-x', 'c++', '-Xclang', '-ast-dump', '-fsyntax-only', '-std=c++20']
 
     # --- Re-add Progress Bar Logic ---
     total_files_to_process = len(source_files['cpp']) + len(source_files['csharp'])
