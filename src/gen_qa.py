@@ -53,10 +53,10 @@ def calculate_complexity(code_block, language="unknown", ast_node=None):
     计算代码块的复杂度指标。
     如果提供了AST节点 (主要用于C++)，则可以计算更精确的指标。
     """
-    lines = code_block.strip().split('\\n')
+    lines = code_block.strip().split('\n')
     lines_of_code = len(lines)
     
-    keyword_count = 0 # General keyword count for non-AST based
+    csharp_keyword_count = 0 # General keyword count for non-AST based
     cyclomatic_complexity = 1 # Default for a straight path of execution
 
     if language == "cpp" and ast_node and LIBCLANG_AVAILABLE:
@@ -101,10 +101,10 @@ def calculate_complexity(code_block, language="unknown", ast_node=None):
     else: # Fallback or for C# (until AST is implemented there)
         code_lower = code_block.lower()
         for keyword in COMPLEXITY_KEYWORDS:
-            keyword_count += len(re.findall(r'\\b' + re.escape(keyword) + r'\\b', code_lower))
+            csharp_keyword_count += len(re.findall(r'\\b' + re.escape(keyword) + r'\\b', code_lower))
         # For non-AST, cyclomatic is not easily calculated, so we use a placeholder or a different metric
         # We can use the old keyword_count based score as a proxy
-        cyclomatic_complexity = keyword_count +1 # Approximation
+        cyclomatic_complexity = csharp_keyword_count +1 # Approximation
 
     # General complexity score - can be adapted
     # If AST was used, cyclomatic_complexity is more meaningful.
@@ -113,11 +113,11 @@ def calculate_complexity(code_block, language="unknown", ast_node=None):
          # For C++ with AST, prioritize cyclomatic complexity
         complexity_score = lines_of_code * 0.2 + cyclomatic_complexity * 1.5
     else:
-        complexity_score = lines_of_code * 0.5 + keyword_count * 1.0
+        complexity_score = lines_of_code * 0.5 + csharp_keyword_count * 1.0
     
     return {
         "lines_of_code": lines_of_code,
-        "control_flow_statements": keyword_count, # Maintained for C#/fallback
+        "control_flow_statements": csharp_keyword_count, # Maintained for C#/fallback
         "cyclomatic_complexity": cyclomatic_complexity if (language == "cpp" and ast_node and LIBCLANG_AVAILABLE) else "N/A (AST not used)",
         "calculated_complexity_score": complexity_score
     }
@@ -141,7 +141,7 @@ def extract_cpp_elements(file_path, compiler_args=None):
         # but we need bodies for complexity and full code.
         # TU_DETAILED_PREPROCESSING_RECORD for macro expansions if needed (adds overhead).
         tu = index.parse(file_path, args=compiler_args, 
-                         options=TranslationUnit.PARSE_SKIP_FUNCTION_BODIES | TranslationUnit.PARSE_DETAILED_PREPROCESSING_RECORD)
+                         options=0) # Use 0 for default parsing (includes function bodies)
 
         if not tu:
             print(f"Error: Unable to parse C++ file {file_path} with libclang.")
@@ -346,35 +346,44 @@ def generate_sft_data(elements, min_complexity_score):
             del element_for_output["ast_node"]
 
         if metrics['calculated_complexity_score'] >= min_complexity_score:
-            instruction = (
-                f"请详细分析以下 {element['language']} 代码 ({element['type']} '{element['name']}') 的功能、核心逻辑、实现方式，"
-                f"并评估其可读性、可维护性和潜在的改进点。\\n"
-                f"代码来源: {element['file_path']}"
-            )
-            output_data = {
+            # instruction = (
+            #     f"请详细分析以下 {element['language']} 代码 ({element['type']} '{element['name']}') 的功能、核心逻辑、实现方式，"
+            #     f"并评估其可读性、可维护性和潜在的改进点。\\n"
+            #     f"代码来源: {element['file_path']}"
+            # )
+            # output_data = {
+            #     "file_path": element['file_path'],
+            #     "element_type": element['type'],
+            #     "element_name": element['name'],
+            #     "language": element['language'],
+            #     "code_block": element['code_block'],
+            #     "metrics": metrics,
+            #     "analysis_prompt": (
+            #         "1. **功能概述**: (请描述该代码块的主要功能和用途)\\n"
+            #         "2. **核心逻辑分析**: (请逐步解释代码块的关键步骤和业务逻辑)\\n"
+            #         "3. **实现方式评估**: (请评论其实现方式的优点和缺点)\\n"
+            #         "4. **可读性与可维护性**: (请评估代码的可读性和可维护性，例如命名、注释、结构等)\\n"
+            #         "5. **复杂度评估**: (根据指标和实际代码，给出综合的复杂度判断)\\n"
+            #         "   - 代码行数: " + str(metrics['lines_of_code']) + "\\n"
+            #         "   - 控制流语句数 (基于关键字): " + str(metrics['control_flow_statements']) + "\\n"
+            #         "   - 圈复杂度 (C++/AST): " + str(metrics.get('cyclomatic_complexity', 'N/A')) + "\\n"
+            #         "   - 计算复杂度得分: " + f"{metrics['calculated_complexity_score']:.2f}" + "\\n"
+            #         "6. **潜在改进点**: (请提出具体的改进建议，例如重构、优化、增加测试等)\\n"
+            #         "7. **上下文依赖**: (此代码块是否严重依赖外部模块、类或特定数据结构？请简要说明)"
+            #     )
+            # }
+            # sft_records.append({
+            #     "instruction": instruction,
+            #     "output": json.dumps(output_data, ensure_ascii=False, indent=2) # Store output as a JSON string
+            # })
+            sft_records.append({
                 "file_path": element['file_path'],
-                "element_type": element['type'],
-                "element_name": element['name'],
+                "type": element['type'],
+                "name": element['name'],
                 "language": element['language'],
                 "code_block": element['code_block'],
                 "metrics": metrics,
-                "analysis_prompt": (
-                    "1. **功能概述**: (请描述该代码块的主要功能和用途)\\n"
-                    "2. **核心逻辑分析**: (请逐步解释代码块的关键步骤和业务逻辑)\\n"
-                    "3. **实现方式评估**: (请评论其实现方式的优点和缺点)\\n"
-                    "4. **可读性与可维护性**: (请评估代码的可读性和可维护性，例如命名、注释、结构等)\\n"
-                    "5. **复杂度评估**: (根据指标和实际代码，给出综合的复杂度判断)\\n"
-                    "   - 代码行数: " + str(metrics['lines_of_code']) + "\\n"
-                    "   - 控制流语句数 (基于关键字): " + str(metrics['control_flow_statements']) + "\\n"
-                    "   - 圈复杂度 (C++/AST): " + str(metrics.get('cyclomatic_complexity', 'N/A')) + "\\n"
-                    "   - 计算复杂度得分: " + f"{metrics['calculated_complexity_score']:.2f}" + "\\n"
-                    "6. **潜在改进点**: (请提出具体的改进建议，例如重构、优化、增加测试等)\\n"
-                    "7. **上下文依赖**: (此代码块是否严重依赖外部模块、类或特定数据结构？请简要说明)"
-                )
-            }
-            sft_records.append({
-                "instruction": instruction,
-                "output": json.dumps(output_data, ensure_ascii=False, indent=2) # Store output as a JSON string
+                
             })
     return sft_records
 
@@ -453,8 +462,12 @@ def main():
 
     try:
         with open(args.output_file, 'w', encoding='utf-8') as f:
-            for record in sft_data:
-                f.write(json.dumps(record, ensure_ascii=False) + '\\n')
+            json.dump(sft_data, f)
+            # content = json.dumps(sft_data)
+            # f.write(content)
+            # json.dumps(sft_data, ensure_ascii=False, indent=2)
+            # for record in sft_data:
+                # f.write(json.dumps(record, ensure_ascii=False) + '\\n')
         print(f"SFT dataset successfully saved to {args.output_file}")
     except IOError as e:
         print(f"Error writing output file {args.output_file}: {e}")
