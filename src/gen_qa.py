@@ -56,69 +56,93 @@ def calculate_complexity(code_block, language="unknown", ast_node=None):
     lines = code_block.strip().split('\n')
     lines_of_code = len(lines)
     
-    csharp_keyword_count = 0 # General keyword count for non-AST based
+    csharp_keyword_count = 0 # For C# or C++ fallback
     cyclomatic_complexity = 1 # Default for a straight path of execution
+
+    num_variable_declarations_in_scope = 0
+    num_comment_blocks = 0
+    total_comment_characters = 0
+    complexity_score = 0 # Initialize
 
     if language == "cpp" and ast_node and LIBCLANG_AVAILABLE:
         # Calculate cyclomatic complexity using AST
-        cyclomatic_complexity = 1 # Start with 1 for the function's single path
-        
-        # Helper function to traverse AST for complexity points
+        current_cyclomatic_complexity = 1 # Renamed to avoid conflict with outer scope variable
         def find_complexity_points(cursor):
-            nonlocal cyclomatic_complexity
-            # Check for control flow statements
+            nonlocal current_cyclomatic_complexity # Use the renamed variable
             if cursor.kind in CPP_CYCLOMATIC_KEYWORDS:
-                cyclomatic_complexity += 1
-            
-            # Check for logical AND and OR within conditions (simplistic check)
-            # A more robust way would be to analyze expression trees.
+                current_cyclomatic_complexity += 1
             if cursor.kind in [CursorKind.IF_STMT, CursorKind.WHILE_STMT, CursorKind.FOR_STMT]:
-                for child in cursor.get_children(): # Look at immediate children for conditions
-                    # This is a very rough check for binary operators in conditions
-                    # and doesn't fully parse the condition expression.
-                    # It's hard to get && and || reliably without deep expression parsing.
-                    # For now, we'll focus on statement kinds.
-                    # A more advanced approach would be needed for &&, ||, ?:
+                for child in cursor.get_children():
                     tokens = [token.spelling for token in child.get_tokens()]
-                    cyclomatic_complexity += tokens.count('&&')
-                    cyclomatic_complexity += tokens.count('||')
-                    # Ternary operator (?:) is also a branch point.
-                    # Finding it accurately in tokens is tricky; AST traversal of expressions is better.
-                    # Example: condition ? true_expr : false_expr
-                    # if '?' in tokens and ':' in tokens:
-                    # cyclomatic_complexity +=1 
-                    break # Usually condition is the first child
-
+                    current_cyclomatic_complexity += tokens.count('&&')
+                    current_cyclomatic_complexity += tokens.count('||')
+                    break
             for child in cursor.get_children():
                 find_complexity_points(child)
-
         find_complexity_points(ast_node)
+        cyclomatic_complexity = current_cyclomatic_complexity # Assign to outer scope var
         
-        # keyword_count can still be calculated for C++ if needed for other metrics,
-        # but cyclomatic is often preferred.
-        # For simplicity, we'll use the AST-based cyclomatic for C++ if available.
+        # --- Count local variable declarations --- 
+        if ast_node.kind in [CursorKind.FUNCTION_DECL, CursorKind.CXX_METHOD, CursorKind.CONSTRUCTOR, CursorKind.DESTRUCTOR]:
+            for child_cursor in ast_node.get_children():
+                if child_cursor.kind == CursorKind.COMPOUND_STMT:
+                    body_stack = list(child_cursor.get_children())
+                    visited_in_body = set()
+                    while body_stack:
+                        stmt_node = body_stack.pop()
+                        if stmt_node.hash in visited_in_body: continue
+                        visited_in_body.add(stmt_node.hash)
+                        if stmt_node.kind == CursorKind.VAR_DECL:
+                            num_variable_declarations_in_scope += 1
+                        if stmt_node.kind == CursorKind.COMPOUND_STMT:
+                            body_stack.extend(list(stmt_node.get_children()))
+                    break
+        
+        # --- Count comments using regex on the code_block for C++ ---
+        if code_block:
+            comment_matches = re.findall(r"//.*|/\*[\s\S]*?\*/", code_block) # Corrected regex for //
+            num_comment_blocks = len(comment_matches)
+            for comment_text in comment_matches:
+                total_comment_characters += len(comment_text)
 
-    else: # Fallback or for C# (until AST is implemented there)
+        complexity_score = (
+            lines_of_code * 0.15 +
+            cyclomatic_complexity * 1.5 +
+            num_variable_declarations_in_scope * 0.4 +
+            num_comment_blocks * 0.25 +
+            total_comment_characters * 0.005
+        )
+        csharp_keyword_count = 0 # Ensure this is 0 for C++ AST path as it's not relevant
+
+    else: # Fallback for C# or if C++ AST is not available
         code_lower = code_block.lower()
         for keyword in COMPLEXITY_KEYWORDS:
-            csharp_keyword_count += len(re.findall(r'\\b' + re.escape(keyword) + r'\\b', code_lower))
-        # For non-AST, cyclomatic is not easily calculated, so we use a placeholder or a different metric
-        # We can use the old keyword_count based score as a proxy
-        cyclomatic_complexity = csharp_keyword_count +1 # Approximation
+            csharp_keyword_count += len(re.findall(r'\b' + re.escape(keyword) + r'\b', code_lower))
+        
+        # Approximate cyclomatic for C# using keyword count for the cyclomatic_complexity variable
+        cyclomatic_complexity = csharp_keyword_count + 1 
 
-    # General complexity score - can be adapted
-    # If AST was used, cyclomatic_complexity is more meaningful.
-    # If not, keyword_count drives it.
-    if language == "cpp" and ast_node and LIBCLANG_AVAILABLE:
-         # For C++ with AST, prioritize cyclomatic complexity
-        complexity_score = lines_of_code * 0.2 + cyclomatic_complexity * 1.5
-    else:
-        complexity_score = lines_of_code * 0.5 + csharp_keyword_count * 1.0
+        if code_block:
+            comment_matches = re.findall(r"//.*|/\*[\s\S]*?\*/", code_block) # Corrected regex for //
+            num_comment_blocks = len(comment_matches)
+            for comment_text in comment_matches:
+                total_comment_characters += len(comment_text)
+
+        complexity_score = (
+            lines_of_code * 0.4 +
+            csharp_keyword_count * 1.0 +
+            num_comment_blocks * 0.25 +
+            total_comment_characters * 0.005
+        )
+        # num_variable_declarations_in_scope remains 0 (or N/A in output) for C#
     
     return {
         "lines_of_code": lines_of_code,
-        "control_flow_statements": csharp_keyword_count, # Maintained for C#/fallback
-        "cyclomatic_complexity": cyclomatic_complexity if (language == "cpp" and ast_node and LIBCLANG_AVAILABLE) else "N/A (AST not used)",
+        "control_flow_statements": csharp_keyword_count,
+        "cyclomatic_complexity": f"{cyclomatic_complexity:.0f}" if (language == "cpp" and ast_node and LIBCLANG_AVAILABLE) else f"Approx: {cyclomatic_complexity:.0f}",
+        "num_variable_declarations": num_variable_declarations_in_scope if (language == "cpp" and ast_node and LIBCLANG_AVAILABLE) else "N/A",
+        "num_comment_blocks": num_comment_blocks,
+        "total_comment_characters": total_comment_characters,
         "calculated_complexity_score": complexity_score
     }
 
