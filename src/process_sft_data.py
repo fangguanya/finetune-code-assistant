@@ -168,9 +168,13 @@ def call_openai_api(prompt, model="gpt-3.5-turbo", max_tokens=1500, temperature=
             return content
         else:
             print("Warning: API response was empty or malformed.")
+            # Log this specific warning case as well
+            log_api_interaction("ERROR", "api_call_empty_response", model, "N/A", "API response was empty or malformed.")
             return None
     except Exception as e:
         print(f"An error occurred while calling the API: {e}")
+        # Log the exception to the interaction log file
+        log_api_interaction("ERROR", "api_call_failure", model, "N/A", str(e))
         time.sleep(5) 
         return None
 
@@ -178,6 +182,16 @@ def add_comments_to_code(code_block, language, element_name, element_type, retri
     """
     Uses OpenAI API to add comments to a given code block.
     """
+#     prompt = f"""分析下面的 {language} 代码片段,针对 {element_type} named '{element_name}'.
+# 分析其主要功能和关键逻辑.
+# 根据你的分析,生成详细的注释,解释代码的各个部分.
+# 确保注释准确、全面,并且与代码逻辑紧密结合.
+# 注释应该清晰地描述代码的用途、实现方式和关键算法.
+# 一定严格保证输入代码块完整的得到处理并输出.
+# 所有思考和输出使用中文.
+# ``` {language}
+# {code_block}
+# ```"""
     prompt = f"""分析下面的 {language} 代码片段,针对 {element_type} named '{element_name}'.
 分析其主要功能和关键逻辑.
 根据你的分析,生成详细的注释,解释代码的各个部分.
@@ -185,9 +199,9 @@ def add_comments_to_code(code_block, language, element_name, element_type, retri
 注释应该清晰地描述代码的用途、实现方式和关键算法.
 一定严格保证输入代码块完整的得到处理并输出.
 所有思考和输出使用中文.
-``` {language}
+输出直接为代码和注释,剔除其他如:cpp```, json 等格式说明字符
 {code_block}
-```"""
+"""
     
     log_api_interaction("PROMPT", "add_comments", model, element_name, prompt)
 
@@ -234,29 +248,40 @@ def generate_qa_pair(code_block, language, element_name, element_type, retries=3
     Uses OpenAI API to analyze code and generate a question-answer pair.
     The provided code_block will be the answer.
     """
+#     prompt = f"""分析下面的 {language} 代码片段,针对 {element_type} named '{element_name}'.
+# 理解其主要功能和关键逻辑.
+# 根据你的分析,生成一个简洁且相关的问题,这个代码片段有效地回答了这个问题.
+# 问题应该是一个开发人员使用提供的代码时所解决的具体问题.
+# 也就是说,提供的代码块本身将作为你生成问题的答案.
+# 所有思考和输出使用中文.
+
+# 格式你的响应为一个JSON对象,包含两个键: "question" 和 "answer".
+# "question" 键的值应该为你生成的问问题.
+# "answer" 键的值应该为精确的原始代码块.
+
+# 原始代码块:
+# ``` {language}
+# {code_block}
+# ```
+
+# JSON 响应格式示例:
+# {{
+#   "question": "生成的问问题...",
+#   "answer": "精确的原始代码块..."
+# }}
+
+# 确保你的JSON响应中的 "answer" 字段包含精确的原始代码块,不要修改或省略任何代码.
+# """
     prompt = f"""分析下面的 {language} 代码片段,针对 {element_type} named '{element_name}'.
 理解其主要功能和关键逻辑.
 根据你的分析,生成一个简洁且相关的问题,这个代码片段有效地回答了这个问题.
 问题应该是一个开发人员使用提供的代码时所解决的具体问题.
 也就是说,提供的代码块本身将作为你生成问题的答案.
 所有思考和输出使用中文.
-
-格式你的响应为一个JSON对象,包含两个键: "question" 和 "answer".
-"question" 键的值应该为你生成的问问题.
-"answer" 键的值应该为精确的原始代码块.
+格式你的响应为问题的中文描述,不用包含代码本身.
 
 原始代码块:
-``` {language}
 {code_block}
-```
-
-JSON 响应格式示例:
-{{
-  "question": "生成的问问题...",
-  "answer": "精确的原始代码块..."
-}}
-
-确保你的JSON响应中的 "answer" 字段包含精确的原始代码块,不要修改或省略任何代码.
 """
     log_api_interaction("PROMPT", "generate_qa", model, element_name, prompt)
 
@@ -275,25 +300,29 @@ JSON 响应格式示例:
                 if processed_response_text.endswith("```"):
                     processed_response_text = processed_response_text[:-3]
                 
-                qa_data = json.loads(processed_response_text.strip())
-                if isinstance(qa_data, dict) and "question" in qa_data and "answer" in qa_data:
-                    # More lenient check for the answer, as LLMs might slightly reformat whitespace or comments
-                    # We mainly care that the core code is there.
-                    # Simple check: non-empty and significant overlap in non-whitespace characters
-                    original_condensed = "".join(code_block.split())
-                    answer_condensed = "".join(str(qa_data["answer"]).split())
+                qa_data = {}
+                qa_data["question"] = processed_response_text.strip()
+                qa_data["answer"] = code_block
+                return qa_data
+                # qa_data = json.loads(processed_response_text.strip())
+                # if isinstance(qa_data, dict) and "question" in qa_data and "answer" in qa_data:
+                #     # More lenient check for the answer, as LLMs might slightly reformat whitespace or comments
+                #     # We mainly care that the core code is there.
+                #     # Simple check: non-empty and significant overlap in non-whitespace characters
+                #     original_condensed = "".join(code_block.split())
+                #     answer_condensed = "".join(str(qa_data["answer"]).split())
 
-                    if len(answer_condensed) > 0.7 * len(original_condensed) and \
-                       (original_condensed in answer_condensed or answer_condensed in original_condensed):
-                        # If LLM reformatted slightly but included original, replace with exact original
-                        qa_data["answer"] = code_block 
-                        return qa_data
-                    else:
-                        print(f"Warning: Q&A answer for '{element_name}' significantly differs from original. Retrying.")
-                        # print(f"Original (condensed): {original_condensed[:100]}...")
-                        # print(f"API Answer (condensed): {answer_condensed[:100]}...")
-                else:
-                    print(f"Warning: Q&A JSON for '{element_name}' is not in the expected format. Response: {response_text[:200]}...")
+                #     if len(answer_condensed) > 0.7 * len(original_condensed) and \
+                #        (original_condensed in answer_condensed or answer_condensed in original_condensed):
+                #         # If LLM reformatted slightly but included original, replace with exact original
+                #         qa_data["answer"] = code_block 
+                #         return qa_data
+                #     else:
+                #         print(f"Warning: Q&A answer for '{element_name}' significantly differs from original. Retrying.")
+                #         # print(f"Original (condensed): {original_condensed[:100]}...")
+                #         # print(f"API Answer (condensed): {answer_condensed[:100]}...")
+                # else:
+                #     print(f"Warning: Q&A JSON for '{element_name}' is not in the expected format. Response: {response_text[:200]}...")
             except json.JSONDecodeError as e:
                 print(f"Error decoding Q&A JSON for '{element_name}': {e}. Response: {response_text[:200]}...")
         
@@ -369,7 +398,7 @@ def main():
     try:
         client = OpenAI(**client_params)
     except Exception as e:
-        print(f"Error initializing OpenAI client: {e}")
+        print(f"Error initializing OpenAI client: {e}")        
         return
 
 
@@ -470,6 +499,7 @@ def main():
                 commenting_succeeded = True
             except Exception as e:
                 print(f"Error saving commented code for '{element_name}' to {commented_file_path}: {e}")
+                log_api_interaction("ERROR", "add_comments_to_code failure", args.model_comment, "N/A", str(e))
         
         if not commenting_succeeded:
             print(f"Skipping Q&A generation for '{element_name}' as commenting failed or produced no code.")
@@ -500,6 +530,7 @@ def main():
                         print(f"Successfully saved individual Q&A to: {individual_qa_filepath}")
                     except Exception as e:
                         print(f"Error saving individual Q&A file {individual_qa_filepath}: {e}")
+                        log_api_interaction("ERROR", "saving individual Q&A file failure", args.model_qa, "N/A", str(e))
                 # --- End New --- 
             else:
                 print(f"Failed to generate Q&A for '{element_name}'.")
