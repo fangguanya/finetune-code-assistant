@@ -278,7 +278,7 @@ def generate_qa_pair(code_block, language, element_name, element_type, retries=3
 问题应该是一个开发人员使用提供的代码时所解决的具体问题.
 也就是说,提供的代码块本身将作为你生成问题的答案.
 所有思考和输出使用中文.
-格式你的响应为问题的中文描述,不用包含代码本身.
+你的输出为问题的中文描述,不用包含代码本身,同时省去中间思考内容.
 
 原始代码块:
 {code_block}

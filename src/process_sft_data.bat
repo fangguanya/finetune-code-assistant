@@ -1,3 +1,3 @@
-::python process_sft_data.py sft_dataset.json ./commented_code ./generated_qa.json --local_api_base_url "http://localhost:11434/v1" --openai_api_key "NA" --model_comment "qwen_unreal" --model_qa "qwen_unreal" 
+::python process_sft_data.py sft_dataset.json ./commented_code ./generated_qa_collated.json --individual_qa_dir ./individual_qas --local_api_base_url "http://localhost:11434/v1" --openai_api_key "NA" --model_comment "qwen_unreal" --model_qa "qwen_unreal" --interaction_log_file "./llm_log.txt"
 
-python process_sft_data.py sft_dataset.json ./commented_code ./generated_qa_collated.json --individual_qa_dir ./individual_qas --local_api_base_url "http://localhost:11434/v1" --openai_api_key "NA" --model_comment "qwen_unreal" --model_qa "qwen_unreal" --interaction_log_file "./llm_log.txt"
+python process_sft_data.py sft_dataset.json ./commented_code ./generated_qa_collated.json --individual_qa_dir ./individual_qas --local_api_base_url "https://api.siliconflow.cn/v1" --openai_api_key "sk-goxqcxvegxcivakvpaaafzfwogskiuhdqbmbaxgonsmqxtep" --model_comment "deepseek-ai/DeepSeek-R1" --model_qa "deepseek-ai/DeepSeek-R1" --interaction_log_file "./llm_log.txt"
