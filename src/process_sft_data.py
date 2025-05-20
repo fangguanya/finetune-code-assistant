@@ -1,12 +1,13 @@
 # process_sft_data.py
 
 import openai
-from openai import OpenAI
+from openai import OpenAI, AsyncOpenAI
 import json
 import os
 import argparse
 import time
 import re
+import asyncio
 
 # Global OpenAI client instance, to be configured in main()
 # This avoids re-initializing the client for every API call.
@@ -24,7 +25,7 @@ interaction_log_filepath = None # Global variable for the log file path
 # It's recommended to use environment variables for API keys.
 
 # --- Helper Functions ---
-def log_api_interaction(direction: str, purpose: str, model: str, element_name: str, content: str):
+def log_api_interaction(direction: str, purpose: str, model: str, element_name: str, content: str, sft_index: int | None = None, processing_filename: str | None = None, attempt_num: int | None = None):
     """Logs an API interaction (prompt or response) to the specified log file."""
     global interaction_log_filepath
     if not interaction_log_filepath:
@@ -32,10 +33,13 @@ def log_api_interaction(direction: str, purpose: str, model: str, element_name: 
 
     log_entry = {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "direction": direction, # "PROMPT" or "RESPONSE"
-        "purpose": purpose,     # e.g., "add_comments", "generate_qa"
-        "model": model,
+        "direction": direction, # "PROMPT" or "RESPONSE" or "ERROR"
+        "purpose": purpose,     # e.g., "add_comments", "generate_qa", "api_call_failure"
+        "sft_index": sft_index,
+        "processing_filename": processing_filename,
         "element_name": element_name,
+        "model": model,
+        "attempt_num": attempt_num,
         "content": content
     }
     try:
@@ -51,7 +55,7 @@ def sanitize_filename(name):
     name = re.sub(r'\s+', '_', name)   # Replace spaces with underscores
     return name
 
-def call_openai_api(prompt, model="gpt-3.5-turbo", max_tokens=1500, temperature=0.5):
+async def call_openai_api(prompt, model="gpt-3.5-turbo", max_tokens=1500, temperature=0.5):
     """
     Makes a call to the configured OpenAI compatible API chat completion endpoint.
     Returns the content of the assistant's reply.
@@ -70,7 +74,7 @@ def call_openai_api(prompt, model="gpt-3.5-turbo", max_tokens=1500, temperature=
     # For this iteration, higher-level functions will log with more context.
 
     try:
-        response = client.chat.completions.create( # Use the client instance
+        stream = await client.chat.completions.create( # Use await here
             model=model,
             messages=[
                 {"role": "system", "content": f"""所有思考和输出使用中文
@@ -162,23 +166,32 @@ def call_openai_api(prompt, model="gpt-3.5-turbo", max_tokens=1500, temperature=
             ],
             max_tokens=max_tokens,
             temperature=temperature,
+            stream=True
         )
-        if response and response.choices and len(response.choices) > 0:
-            content = response.choices[0].message.content.strip()
-            return content
-        else:
-            print("Warning: API response was empty or malformed.")
-            # Log this specific warning case as well
-            log_api_interaction("ERROR", "api_call_empty_response", model, "N/A", "API response was empty or malformed.")
+        
+        collected_content = []
+        async for chunk in stream: # Use async for here
+            if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                collected_content.append(chunk.choices[0].delta.content)
+        
+        full_response_content = "".join(collected_content).strip()
+
+        if not full_response_content:
+            print("Warning: API stream yielded no content or was malformed.")
+            log_api_interaction("ERROR", "api_call_empty_stream", model, "N/A", "API stream yielded no content.", sft_index=None, processing_filename=None, attempt_num=None)
             return None
+        return full_response_content
+
     except Exception as e:
-        print(f"An error occurred while calling the API: {e}")
-        # Log the exception to the interaction log file
-        log_api_interaction("ERROR", "api_call_failure", model, "N/A", str(e))
-        time.sleep(5) 
+        print(f"An error occurred while calling the API (streaming): {e}")
+        log_api_interaction("ERROR", "api_call_failure_streaming", model, "N/A", str(e), sft_index=None, processing_filename=None, attempt_num=None)
+        # Consider if time.sleep should be replaced with asyncio.sleep if this function itself becomes async
+        # For now, if call_openai_api is async, time.sleep will block the event loop. 
+        # This should be asyncio.sleep(5) if the function is async.
+        await asyncio.sleep(5) # Changed to asyncio.sleep
         return None
 
-def add_comments_to_code(code_block, language, element_name, element_type, retries=3, model="gpt-3.5-turbo"):
+async def add_comments_to_code(code_block, language, element_name, element_type, retries=10, model="gpt-3.5-turbo", sft_index: int | None = None, base_output_filename_for_log: str | None = None):
     """
     Uses OpenAI API to add comments to a given code block.
     """
@@ -199,51 +212,66 @@ def add_comments_to_code(code_block, language, element_name, element_type, retri
 注释应该清晰地描述代码的用途、实现方式和关键算法.
 一定严格保证输入代码块完整的得到处理并输出.
 所有思考和输出使用中文.
-输出直接为代码和注释,剔除其他如:cpp```, json 等格式说明字符
+输出只能包含代码本身和相关的注释,剔除其他如:cpp```, json 等格式说明字符
+例如:
+输入：
+void SayHello()
+{{
+    UE_LOG(LogTemp, Log, TEXT("Hello, World!"));
+}}
+
+输出:
+// 输出Hello, World!到日志
+void SayHello()
+{{
+    UE_LOG(LogTemp, Log, TEXT("Hello, World!"));
+}}
+
 {code_block}
 """
     
-    log_api_interaction("PROMPT", "add_comments", model, element_name, prompt)
+    log_api_interaction("PROMPT", "add_comments", model, element_name, prompt, sft_index=sft_index, processing_filename=base_output_filename_for_log, attempt_num=1) # Log first attempt
 
     for attempt in range(retries):
         print(f"Attempt {attempt + 1}/{retries} to add comments to '{element_name}' (model: {model})...")
-        api_response_content = call_openai_api(prompt, model=model, max_tokens=len(code_block.split()) + 700)
+        api_response_content = await call_openai_api(prompt, model=model, max_tokens=len(code_block.split()) + 700)
         
-        log_api_interaction("RESPONSE", "add_comments", model, element_name, api_response_content if api_response_content else "<API response was None or empty>")
+        log_api_interaction("RESPONSE", "add_comments", model, element_name, api_response_content if api_response_content else "<API response was None or empty>", sft_index=sft_index, processing_filename=base_output_filename_for_log, attempt_num=attempt + 1)
 
         if api_response_content: # Renamed from commented_code for clarity before processing
+            return api_response_content.strip()
             # Basic check to see if the output looks like code (might need refinement)
-            if "```" in api_response_content: 
-                match = re.search(rf"```{language}\s*([\s\S]+?)```|```\s*([\s\S]+?)```", api_response_content, re.DOTALL)
-                if match:
-                    extracted = match.group(1) or match.group(2)
-                    if extracted:
-                        original_lines = code_block.splitlines()
-                        if any(line.strip() in extracted for line in original_lines if line.strip()):
-                            return extracted.strip()
-                        else:
-                            print(f"Warning: Commented code for '{element_name}' from API did not seem to retain original code structure after extraction. Output:\n{api_response_content[:300]}...")
-                else: 
-                     print(f"Warning: Commented code for '{element_name}' from API was wrapped in ``` but extraction failed. Output:\n{api_response_content[:300]}...")
-                     # Fallback to heuristic if extraction fails but ``` was present
-                     if len(api_response_content) > len(code_block) * 0.5 and any(line.strip() in api_response_content for line in code_block.splitlines() if line.strip() and not line.strip().startswith("//") and not line.strip().startswith("/*")):
-                         return api_response_content 
-            elif "{{" in api_response_content or "}}" in api_response_content or "def " in api_response_content or "class " in api_response_content or "void " in api_response_content or "public " in api_response_content : 
-                 original_lines = code_block.splitlines()
-                 present_original_lines = sum(1 for line in original_lines if line.strip() and line.strip() in api_response_content)
-                 if present_original_lines > min(3, len(original_lines) / 2): 
-                    return api_response_content.strip()
-                 else:
-                    print(f"Warning: Commented code for '{element_name}' from API was unwrapped and didn't seem to contain enough original code. Output:\n{api_response_content[:300]}...")
+            # if "```" in api_response_content: 
+            #     match = re.search(rf"```{language}\s*([\s\S]+?)```|```\s*([\s\S]+?)```", api_response_content, re.DOTALL)
+            #     if match:
+            #         extracted = match.group(1) or match.group(2)
+            #         if extracted:
+            #             original_lines = code_block.splitlines()
+            #             if any(line.strip() in extracted for line in original_lines if line.strip()):
+            #                 return extracted.strip()
+            #             else:
+            #                 print(f"Warning: Commented code for '{element_name}' from API did not seem to retain original code structure after extraction. Output:\n{api_response_content[:300]}...")
+            #     else: 
+            #          print(f"Warning: Commented code for '{element_name}' from API was wrapped in ``` but extraction failed. Output:\n{api_response_content[:300]}...")
+            #          # Fallback to heuristic if extraction fails but ``` was present
+            #          if len(api_response_content) > len(code_block) * 0.5 and any(line.strip() in api_response_content for line in code_block.splitlines() if line.strip() and not line.strip().startswith("//") and not line.strip().startswith("/*")):
+            #              return api_response_content 
+            # elif "{{" in api_response_content or "}}" in api_response_content or "def " in api_response_content or "class " in api_response_content or "void " in api_response_content or "public " in api_response_content : 
+            #      original_lines = code_block.splitlines()
+            #      present_original_lines = sum(1 for line in original_lines if line.strip() and line.strip() in api_response_content)
+            #      if present_original_lines > min(3, len(original_lines) / 2): 
+            #         return api_response_content.strip()
+            #      else:
+            #         print(f"Warning: Commented code for '{element_name}' from API was unwrapped and didn't seem to contain enough original code. Output:\n{api_response_content[:300]}...")
 
 
         print(f"Failed to get valid commented code for '{element_name}' on attempt {attempt + 1}. Retrying after delay...")
-        time.sleep(5 + attempt * 5) # Exponential backoff
+        await asyncio.sleep(5 + attempt * 5) # Exponential backoff
     print(f"Error: Could not generate comments for '{element_name}' after {retries} retries.")
     return None
 
 
-def generate_qa_pair(code_block, language, element_name, element_type, retries=3, model="gpt-3.5-turbo"):
+async def generate_qa_pair(code_block, language, element_name, element_type, retries=3, model="gpt-3.5-turbo", sft_index: int | None = None, base_output_filename_for_log: str | None = None):
     """
     Uses OpenAI API to analyze code and generate a question-answer pair.
     The provided code_block will be the answer.
@@ -279,17 +307,27 @@ def generate_qa_pair(code_block, language, element_name, element_type, retries=3
 也就是说,提供的代码块本身将作为你生成问题的答案.
 所有思考和输出使用中文.
 你的输出为问题的中文描述,不用包含代码本身,同时省去中间思考内容.
+例如:
+输入:
+// 输出Hello, World!到日志
+void SayHello()
+{{
+    UE_LOG(LogTemp, Log, TEXT("Hello, World!"));
+}}
+
+输出:
+如何输出Hello, World!到日志?
 
 原始代码块:
 {code_block}
 """
-    log_api_interaction("PROMPT", "generate_qa", model, element_name, prompt)
+    log_api_interaction("PROMPT", "generate_qa", model, element_name, prompt, sft_index=sft_index, processing_filename=base_output_filename_for_log, attempt_num=1) # Log first attempt
 
     for attempt in range(retries):
         print(f"Attempt {attempt + 1}/{retries} to generate Q&A for '{element_name}' (model: {model})...")
-        response_text = call_openai_api(prompt, model=model, max_tokens=len(code_block.split()) + 400)
+        response_text = await call_openai_api(prompt, model=model, max_tokens=len(code_block.split()) + 400)
 
-        log_api_interaction("RESPONSE", "generate_qa", model, element_name, response_text if response_text else "<API response was None or empty>")
+        log_api_interaction("RESPONSE", "generate_qa", model, element_name, response_text if response_text else "<API response was None or empty>", sft_index=sft_index, processing_filename=base_output_filename_for_log, attempt_num=attempt + 1)
 
         if response_text:
             try:
@@ -321,13 +359,11 @@ def generate_qa_pair(code_block, language, element_name, element_type, retries=3
                 #         print(f"Warning: Q&A answer for '{element_name}' significantly differs from original. Retrying.")
                 #         # print(f"Original (condensed): {original_condensed[:100]}...")
                 #         # print(f"API Answer (condensed): {answer_condensed[:100]}...")
-                # else:
-                #     print(f"Warning: Q&A JSON for '{element_name}' is not in the expected format. Response: {response_text[:200]}...")
             except json.JSONDecodeError as e:
                 print(f"Error decoding Q&A JSON for '{element_name}': {e}. Response: {response_text[:200]}...")
         
         print(f"Failed to get valid Q&A for '{element_name}' on attempt {attempt + 1}. Retrying after delay...")
-        time.sleep(5 + attempt * 5)
+        await asyncio.sleep(5 + attempt * 5)
     print(f"Error: Could not generate Q&A pair for '{element_name}' after {retries} retries.")
     return None
 
@@ -341,6 +377,144 @@ def format_time(seconds): # Copied from gen_qa.py for ETA display
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
     else:
         return f"{minutes:02d}:{secs:02d}"
+
+async def process_items_async(args, sft_data_subset, client_ref): # Added client_ref
+    """Asynchronously processes SFT data items."""
+    global client # Ensure we're referencing the global client if needed, or use client_ref
+    client = client_ref # Assign the passed client to the global one if other functions rely on global client
+
+    all_qa_pairs = []
+    total_to_process = len(sft_data_subset)
+    processed_count = 0
+    script_start_time = time.time() # This time is from the start of async processing
+
+    for i_subset, record in enumerate(sft_data_subset):
+        # Calculate original SFT index if needed, sft_data_subset is already the slice
+        original_sft_index = args.start_index + i_subset 
+        item_start_time = time.time()
+        
+        print(f"--- Processing item {processed_count + 1}/{total_to_process} (SFT index: {original_sft_index}) ---")
+        
+        code_block = record.get("code_block")
+        language = record.get("language", "unknown")
+        element_name = record.get("name", f"element_{original_sft_index}")
+        element_type = record.get("type", "unknown_type")
+
+        if not code_block:
+            print(f"Warning: No code_block found for item at SFT index {original_sft_index}. Skipping.")
+            processed_count += 1
+            item_duration = time.time() - item_start_time
+            elapsed_total_time = time.time() - script_start_time
+            avg_time_per_item_so_far = elapsed_total_time / processed_count if processed_count > 0 else 0
+            remaining_items_for_eta = total_to_process - processed_count
+            eta = remaining_items_for_eta * avg_time_per_item_so_far if avg_time_per_item_so_far > 0 and remaining_items_for_eta > 0 else 0
+            print(f"Finished item {processed_count}/{total_to_process} (SFT idx: {original_sft_index}, Status: NoCodeBlock) in {item_duration:.2f}s. ETA: {format_time(eta)}")
+            print("-" * 40)
+            continue
+
+        # Determine the base output filename (e.g., 0_MyFunc.cpp or 1_MyClass.cs)
+        # This will be used for logging consistency.
+        clean_name_for_file = sanitize_filename(element_name)
+        base_name_part = f"{original_sft_index}_{clean_name_for_file}"
+        
+        # Attempt to use original extension or language-based extension for the root name
+        output_filename_root_for_logging_and_base = base_name_part # Default if no extension logic applies
+        original_file_path_val_for_ext = record.get("file_path")
+        if original_file_path_val_for_ext:
+            original_ext = os.path.splitext(original_file_path_val_for_ext)[1]
+            if original_ext and original_ext.lower() in ['.cpp', '.h', '.hpp', '.c', '.cc', '.cs']:
+                output_filename_root_for_logging_and_base = base_name_part + original_ext
+            # If original_ext is not a recognized code one, try language (but prioritize original if valid)
+            elif language == "cpp": output_filename_root_for_logging_and_base = base_name_part + ".cpp"
+            elif language == "csharp": output_filename_root_for_logging_and_base = base_name_part + ".cs"
+        elif language == "cpp": # No original_file_path, use language
+            output_filename_root_for_logging_and_base = base_name_part + ".cpp"
+        elif language == "csharp":
+            output_filename_root_for_logging_and_base = base_name_part + ".cs"
+        # At this point, output_filename_root_for_logging_and_base is our unified name for logs
+
+        print(f"Step 1: Adding comments to '{element_name}' ({language})...")
+        commented_code = await add_comments_to_code(code_block, language, element_name, element_type, model=args.model_comment, sft_index=original_sft_index, base_output_filename_for_log=output_filename_root_for_logging_and_base)
+        
+        commenting_succeeded = False
+        # commented_file_base_name_for_qa was previously output_filename_root, now we use output_filename_root_for_logging_and_base for its role as a base
+
+        if commented_code:
+            # The actual output filename for the .txt file still uses output_filename_root_for_logging_and_base and adds .txt
+            output_filename_with_txt = output_filename_root_for_logging_and_base + ".txt"
+            commented_file_path = os.path.join(args.commented_code_dir, output_filename_with_txt)
+            try:
+                with open(commented_file_path, 'w', encoding='utf-8') as f_out:
+                    f_out.write(commented_code)
+                print(f"Successfully saved commented code to: {commented_file_path}")
+                commenting_succeeded = True
+            except Exception as e:
+                print(f"Error saving commented code for '{element_name}' to {commented_file_path}: {e}")
+                log_api_interaction(
+                    direction="ERROR", 
+                    purpose="save_commented_code_failure", 
+                    model=args.model_comment, 
+                    element_name=element_name, 
+                    content=str(e),
+                    sft_index=original_sft_index,
+                    processing_filename=output_filename_root_for_logging_and_base, # Unified name
+                    attempt_num=None
+                )
+        
+        if not commenting_succeeded:
+            print(f"Skipping Q&A generation for '{element_name}' as commenting failed or produced no code.")
+
+        qa_generated_successfully = False
+        if commenting_succeeded:
+            print(f"Step 2: Generating Q&A for '{element_name}' using original code...")
+            qa_pair = await generate_qa_pair(code_block, language, element_name, element_type, model=args.model_qa, sft_index=original_sft_index, base_output_filename_for_log=output_filename_root_for_logging_and_base)
+            
+            if qa_pair:
+                qa_pair["original_sft_index"] = original_sft_index
+                qa_pair["element_name"] = element_name
+                qa_pair["language"] = language
+                qa_pair["source_file"] = record.get("file_path", "N/A")
+                all_qa_pairs.append(qa_pair)
+                print(f"Successfully generated Q&A for '{element_name}'.")
+                qa_generated_successfully = True
+
+                if args.individual_qa_dir and output_filename_root_for_logging_and_base: # Check new root name
+                    individual_qa_filename = f"{output_filename_root_for_logging_and_base}.json"
+                    individual_qa_filepath = os.path.join(args.individual_qa_dir, individual_qa_filename)
+                    try:
+                        with open(individual_qa_filepath, 'w', encoding='utf-8') as f_ind_qa:
+                            json.dump(qa_pair, f_ind_qa, indent=2, ensure_ascii=False)
+                        print(f"Successfully saved individual Q&A to: {individual_qa_filepath}")
+                    except Exception as e:
+                        print(f"Error saving individual Q&A file {individual_qa_filepath}: {e}")
+                        log_api_interaction(
+                            direction="ERROR", 
+                            purpose="save_individual_qa_failure", 
+                            model=args.model_qa, 
+                            element_name=element_name, 
+                            content=str(e),
+                            sft_index=original_sft_index,
+                            processing_filename=output_filename_root_for_logging_and_base, # Unified name
+                            attempt_num=None
+                        )
+            else:
+                print(f"Failed to generate Q&A for '{element_name}'.")
+        
+        processed_count += 1
+        item_duration = time.time() - item_start_time
+        elapsed_total_time = time.time() - script_start_time
+        avg_time_per_item = elapsed_total_time / processed_count if processed_count > 0 else 0
+        remaining_items = total_to_process - processed_count
+        eta = remaining_items * avg_time_per_item if avg_time_per_item > 0 and remaining_items > 0 else 0
+        
+        status_msg = "OK"
+        if not commenting_succeeded: status_msg = "CommentFail"
+        elif not qa_generated_successfully: status_msg = "QAFail"
+
+        print(f"Finished item {processed_count}/{total_to_process} (SFT idx: {original_sft_index}, Status: {status_msg}) in {item_duration:.2f}s. ETA: {format_time(eta)}")
+        print("-" * 40)
+    
+    return all_qa_pairs # Return the collected Q&A pairs
 
 # --- Main Script Logic ---
 def main():
@@ -396,9 +570,10 @@ def main():
         print(f"Logging API interactions to: {interaction_log_filepath}")
 
     try:
-        client = OpenAI(**client_params)
+        # Initialize AsyncOpenAI client
+        client = AsyncOpenAI(**client_params)
     except Exception as e:
-        print(f"Error initializing OpenAI client: {e}")        
+        print(f"Error initializing OpenAI client: {e}")
         return
 
 
@@ -422,8 +597,9 @@ def main():
         print(f"Error reading or parsing SFT input file {args.sft_input_file}: {e}")
         return
 
-    all_qa_pairs = []
-    
+    # all_qa_pairs will be populated by the async function
+    # total_to_process, processed_count, script_start_time are now managed within process_items_async
+
     start_idx = args.start_index
     end_idx = len(sft_data)
     if args.max_items is not None:
@@ -435,125 +611,17 @@ def main():
         
     print(f"Processing items from index {start_idx} to {end_idx -1} using comment model '{args.model_comment}' and Q&A model '{args.model_qa}'.")
 
-    total_to_process = end_idx - start_idx
-    processed_count = 0
-    script_start_time = time.time()
+    sft_data_to_process = sft_data[start_idx:end_idx]
+    
+    # Run the asynchronous processing
+    # Pass the initialized client to the async function
+    all_qa_pairs_results = asyncio.run(process_items_async(args, sft_data_to_process, client))
 
-    for i in range(start_idx, end_idx):
-        record = sft_data[i]
-        item_start_time = time.time()
-        
-        print(f"--- Processing item {processed_count + 1}/{total_to_process} (SFT index: {i}) ---")
-        
-        code_block = record.get("code_block")
-        language = record.get("language", "unknown")
-        element_name = record.get("name", f"element_{i}")
-        element_type = record.get("type", "unknown_type")
-
-        if not code_block:
-            print(f"Warning: No code_block found for item at SFT index {i}. Skipping.")
-            # processed_count is incremented at the end of the loop or in specific skip conditions
-            processed_count += 1 # Ensure count is incremented if we skip due to no code block
-            item_duration = time.time() - item_start_time
-            elapsed_total_time = time.time() - script_start_time
-            avg_time_per_item_so_far = elapsed_total_time / processed_count if processed_count > 0 else 0
-            remaining_items_for_eta = total_to_process - processed_count
-            eta = remaining_items_for_eta * avg_time_per_item_so_far if avg_time_per_item_so_far > 0 and remaining_items_for_eta > 0 else 0
-            print(f"Finished item {processed_count}/{total_to_process} (SFT idx: {i}, Status: NoCodeBlock) in {item_duration:.2f}s. ETA: {format_time(eta)}")
-            print("-" * 40)
-            continue # Jump to the next iteration of the loop
-
-        # 2. Add comments and save
-        print(f"Step 1: Adding comments to '{element_name}' ({language})...")
-        commented_code = add_comments_to_code(code_block, language, element_name, element_type, model=args.model_comment)
-        
-        commenting_succeeded = False
-        commented_file_base_name_for_qa = None # To store the base filename for Q&A file naming
-
-        if commented_code:
-            clean_name = sanitize_filename(element_name)
-            base_filename = f"{i}_{clean_name}"
-            original_file_path = record.get("file_path")
-            output_filename_root = base_filename # default filename root without .txt
-            
-            if original_file_path:
-                original_ext = os.path.splitext(original_file_path)[1]
-                if original_ext and original_ext in ['.cpp', '.h', '.hpp', '.c', '.cc', '.cs']:
-                     output_filename_root = f"{i}_{clean_name}{original_ext}"
-                else: # if original_file_path has no valid ext, try language
-                    if language == "cpp": output_filename_root = f"{i}_{clean_name}.cpp"
-                    elif language == "csharp": output_filename_root = f"{i}_{clean_name}.cs"
-            elif language == "cpp": # no original_file_path, use language
-                 output_filename_root = f"{i}_{clean_name}.cpp"
-            elif language == "csharp":
-                 output_filename_root = f"{i}_{clean_name}.cs"
-            
-            commented_file_base_name_for_qa = output_filename_root # Store this for Q&A file
-            output_filename_with_txt = output_filename_root + ".txt"
-
-            commented_file_path = os.path.join(args.commented_code_dir, output_filename_with_txt)
-            try:
-                with open(commented_file_path, 'w', encoding='utf-8') as f_out:
-                    f_out.write(commented_code)
-                print(f"Successfully saved commented code to: {commented_file_path}")
-                commenting_succeeded = True
-            except Exception as e:
-                print(f"Error saving commented code for '{element_name}' to {commented_file_path}: {e}")
-                log_api_interaction("ERROR", "add_comments_to_code failure", args.model_comment, "N/A", str(e))
-        
-        if not commenting_succeeded:
-            print(f"Skipping Q&A generation for '{element_name}' as commenting failed or produced no code.")
-            # No continue here, processed_count is incremented at the end
-
-        # 3. Generate Q&A pair (using original code block as per requirement)
-        qa_generated_successfully = False
-        if commenting_succeeded: # Only proceed to Q&A if commenting was okay
-            print(f"Step 2: Generating Q&A for '{element_name}' using original code...")
-            qa_pair = generate_qa_pair(code_block, language, element_name, element_type, model=args.model_qa)
-            
-            if qa_pair:
-                qa_pair["original_sft_index"] = i
-                qa_pair["element_name"] = element_name
-                qa_pair["language"] = language
-                qa_pair["source_file"] = record.get("file_path", "N/A")
-                all_qa_pairs.append(qa_pair)
-                print(f"Successfully generated Q&A for '{element_name}'.")
-                qa_generated_successfully = True
-
-                # --- New: Save individual Q&A file ---
-                if args.individual_qa_dir and commented_file_base_name_for_qa:
-                    individual_qa_filename = f"{commented_file_base_name_for_qa}.json"
-                    individual_qa_filepath = os.path.join(args.individual_qa_dir, individual_qa_filename)
-                    try:
-                        with open(individual_qa_filepath, 'w', encoding='utf-8') as f_ind_qa:
-                            json.dump(qa_pair, f_ind_qa, indent=2, ensure_ascii=False)
-                        print(f"Successfully saved individual Q&A to: {individual_qa_filepath}")
-                    except Exception as e:
-                        print(f"Error saving individual Q&A file {individual_qa_filepath}: {e}")
-                        log_api_interaction("ERROR", "saving individual Q&A file failure", args.model_qa, "N/A", str(e))
-                # --- End New --- 
-            else:
-                print(f"Failed to generate Q&A for '{element_name}'.")
-        
-        processed_count += 1 # Increment after attempting both steps for an item
-        item_duration = time.time() - item_start_time
-        elapsed_total_time = time.time() - script_start_time
-        avg_time_per_item = elapsed_total_time / processed_count if processed_count > 0 else 0
-        remaining_items = total_to_process - processed_count
-        eta = remaining_items * avg_time_per_item if avg_time_per_item > 0 and remaining_items > 0 else 0
-        
-        status_msg = "OK"
-        if not commenting_succeeded: status_msg = "CommentFail"
-        elif not qa_generated_successfully: status_msg = "QAFail"
-
-        print(f"Finished item {processed_count}/{total_to_process} (SFT idx: {i}, Status: {status_msg}) in {item_duration:.2f}s. ETA: {format_time(eta)}")
-        print("-" * 40)
-
-    # Save all Q&A pairs
+    # Save all Q&A pairs (results from async processing)
     try:
         with open(args.qa_output_file, 'w', encoding='utf-8') as f_qa:
-            json.dump(all_qa_pairs, f_qa, indent=2, ensure_ascii=False)
-        print(f"\nSuccessfully saved all Q&A pairs ({len(all_qa_pairs)} generated) to: {args.qa_output_file}")
+            json.dump(all_qa_pairs_results, f_qa, indent=2, ensure_ascii=False)
+        print(f"\nSuccessfully saved all Q&A pairs ({len(all_qa_pairs_results)} generated) to: {args.qa_output_file}")
     except Exception as e:
         print(f"Error saving Q&A pairs to {args.qa_output_file}: {e}")
 
