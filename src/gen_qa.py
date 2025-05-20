@@ -3,6 +3,7 @@ import os
 import re
 import argparse
 import json
+import time # Import the time module
 
 # NEW: Import for libclang
 try:
@@ -68,15 +69,24 @@ def calculate_complexity(code_block, language="unknown", ast_node=None):
         # Calculate cyclomatic complexity using AST
         current_cyclomatic_complexity = 1 # Renamed to avoid conflict with outer scope variable
         def find_complexity_points(cursor):
-            nonlocal current_cyclomatic_complexity # Use the renamed variable
-            if cursor.kind in CPP_CYCLOMATIC_KEYWORDS:
-                current_cyclomatic_complexity += 1
-            if cursor.kind in [CursorKind.IF_STMT, CursorKind.WHILE_STMT, CursorKind.FOR_STMT]:
-                for child in cursor.get_children():
-                    tokens = [token.spelling for token in child.get_tokens()]
-                    current_cyclomatic_complexity += tokens.count('&&')
-                    current_cyclomatic_complexity += tokens.count('||')
-                    break
+            nonlocal current_cyclomatic_complexity
+            try:
+                kind = cursor.kind # Access kind here to catch potential ValueError early
+                if kind in CPP_CYCLOMATIC_KEYWORDS:
+                    current_cyclomatic_complexity += 1
+                
+                if kind in [CursorKind.IF_STMT, CursorKind.WHILE_STMT, CursorKind.FOR_STMT]:
+                    for child in cursor.get_children():
+                        tokens = [token.spelling for token in child.get_tokens()]
+                        current_cyclomatic_complexity += tokens.count('&&')
+                        current_cyclomatic_complexity += tokens.count('||')
+                        break
+            except ValueError as e:
+                # If kind is unknown, libclang might raise ValueError. Silently skip this node for complexity.
+                # A more advanced solution might log this if verbose mode is on.
+                # print(f"Warning: Encountered an unknown CursorKind for node '{cursor.spelling}'. Details: {e}")
+                pass # Silently ignore for now to allow script to continue
+
             for child in cursor.get_children():
                 find_complexity_points(child)
         find_complexity_points(ast_node)
@@ -415,7 +425,7 @@ def main():
     parser = argparse.ArgumentParser(description="Scan C++/C# source files, analyze complexity, and generate SFT data.")
     parser.add_argument("source_directory", type=str, help="The root directory of the source code to scan.")
     parser.add_argument("-o", "--output_file", type=str, default="sft_dataset.json", help="The output file for SFT data (JSON Lines format).")
-    parser.add_argument("-m", "--min_complexity", type=float, default=10.0, help="Minimum complexity score for a code element to be included in the SFT dataset.")
+    parser.add_argument("-m", "--min_complexity", type=float, default=5.0, help="Minimum complexity score for a code element to be included in the SFT dataset.")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output.")
     parser.add_argument("--cpp_compiler_args", type=str, help="Comma-separated compiler arguments for C++ parsing (e.g., '-std=c++17,-Iinclude').")
 
@@ -442,16 +452,35 @@ def main():
     else:
         cpp_args = ['-x', 'c++', '-Xclang', '-ast-dump', '-fsyntax-only', '-std=c++20']
 
-    # --- Re-add Progress Bar Logic ---
+    # --- Progress Bar Logic with ETA ---
     total_files_to_process = len(source_files['cpp']) + len(source_files['csharp'])
     processed_files_count = 0
+    start_time = time.time() # Record start time
 
-    def print_progress(processed, total, file_name=""):
+    def format_time(seconds):
+        """Formats seconds into HH:MM:SS or MM:SS string."""
+        if seconds < 0: seconds = 0
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        else:
+            return f"{minutes:02d}:{secs:02d}"
+
+    def print_progress(processed, total, file_name="", eta_seconds=None):
         percentage = (processed / total) * 100 if total > 0 else 0
-        bar_length = 40
+        bar_length = 30 # Reduced bar length to make space for ETA
         filled_length = int(bar_length * processed // total) if total > 0 else 0
         bar = '█' * filled_length + '-' * (bar_length - filled_length)
-        status_line = f'Progress: |{bar}| {percentage:.2f}% ({processed}/{total}) Processing: {file_name[:50]:<50}'
+        
+        eta_str = ""
+        if eta_seconds is not None and processed > 0 and processed < total:
+            eta_str = f" ETA: {format_time(eta_seconds)}"
+        elif processed == total:
+            eta_str = f" Took: {format_time(time.time() - start_time)}"
+
+        status_line = f'Progress: |{bar}| {percentage:.2f}% ({processed}/{total}){eta_str} Processing: {file_name[:40]:<40}'
         print(f'\r{status_line}', end='')
         if processed == total:
             print() # Newline at the end
@@ -487,7 +516,11 @@ def main():
                             print("Warning: libclang not found, C++ processing will be skipped.")
                         # Increment count for skipped files for progress bar accuracy
                         processed_files_count += len(files) 
-                        print_progress(processed_files_count, total_files_to_process, "Skipping C++ files")
+                        # Calculate ETA even when skipping
+                        elapsed_time = time.time() - start_time
+                        avg_time_per_file = elapsed_time / processed_files_count if processed_files_count > 0 else 0
+                        eta = (total_files_to_process - processed_files_count) * avg_time_per_file if avg_time_per_file > 0 else None
+                        print_progress(processed_files_count, total_files_to_process, "Skipping C++ files", eta)
                         continue 
                 elif lang == 'csharp':
                     if args.verbose:
@@ -497,18 +530,28 @@ def main():
                 if not extractor:
                     # Should not happen if lang is cpp or csharp, but as a safeguard
                     processed_files_count += len(files)
-                    print_progress(processed_files_count, total_files_to_process, f"Skipping {lang} files (no extractor)")
+                    elapsed_time = time.time() - start_time
+                    avg_time_per_file = elapsed_time / processed_files_count if processed_files_count > 0 else 0
+                    eta = (total_files_to_process - processed_files_count) * avg_time_per_file if avg_time_per_file > 0 else None
+                    print_progress(processed_files_count, total_files_to_process, f"Skipping {lang} files (no extractor)", eta)
                     continue
 
                 for file_path in files:
                     current_file_name = os.path.basename(file_path)
+                    
+                    # Calculate ETA before printing progress
+                    eta_value = None
+                    if processed_files_count > 0: # Avoid division by zero and calculate ETA after at least one file
+                        elapsed_time = time.time() - start_time
+                        avg_time_per_file = elapsed_time / processed_files_count
+                        remaining_files = total_files_to_process - processed_files_count
+                        eta_value = remaining_files * avg_time_per_file
+
                     if args.verbose:
-                        # Verbose mode: print which file it's processing BEFORE the progress bar update for this file
                         print(f"\nProcessing {lang.upper()} file: {file_path}") 
-                        print_progress(processed_files_count, total_files_to_process, current_file_name)
+                        print_progress(processed_files_count, total_files_to_process, current_file_name, eta_value)
                     else:
-                        # Non-verbose: update progress bar with current file being processed
-                        print_progress(processed_files_count, total_files_to_process, current_file_name)
+                        print_progress(processed_files_count, total_files_to_process, current_file_name, eta_value)
                     
                     file_elements = extractor(file_path)
                     
@@ -526,13 +569,21 @@ def main():
                             first_record_written_to_file = True
                     
                     processed_files_count += 1
-                    # Update progress after processing the file
+                    
+                    # Recalculate ETA after processing for more accuracy if needed, or use previous for display
+                    # For simplicity, we use the ETA calculated before processing for the current line update.
+                    # More sophisticated ETA could re-calculate here.
+                    final_eta_value = None
+                    if processed_files_count > 0:
+                        elapsed_time_after = time.time() - start_time
+                        avg_time_per_file_after = elapsed_time_after / processed_files_count
+                        remaining_files_after = total_files_to_process - processed_files_count
+                        final_eta_value = remaining_files_after * avg_time_per_file_after
+
                     if args.verbose:
-                        # For verbose, the progress bar might have already been updated before detailed processing print
-                        # So, ensure it reflects the count correctly after processing.
-                        print_progress(processed_files_count, total_files_to_process, current_file_name) 
+                        print_progress(processed_files_count, total_files_to_process, current_file_name, final_eta_value) 
                     else:
-                        print_progress(processed_files_count, total_files_to_process, current_file_name)
+                        print_progress(processed_files_count, total_files_to_process, current_file_name, final_eta_value)
 
             if first_record_written_to_file: # if any record was written, add a final newline before closing bracket
                  outfile.write("\n")
