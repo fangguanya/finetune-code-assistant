@@ -184,6 +184,7 @@ def add_comments_to_code(code_block, language, element_name, element_type, retri
 确保注释准确、全面,并且与代码逻辑紧密结合.
 注释应该清晰地描述代码的用途、实现方式和关键算法.
 一定严格保证输入代码块完整的得到处理并输出.
+所有思考和输出使用中文.
 ``` {language}
 {code_block}
 ```"""
@@ -238,6 +239,7 @@ def generate_qa_pair(code_block, language, element_name, element_type, retries=3
 根据你的分析,生成一个简洁且相关的问题,这个代码片段有效地回答了这个问题.
 问题应该是一个开发人员使用提供的代码时所解决的具体问题.
 也就是说,提供的代码块本身将作为你生成问题的答案.
+所有思考和输出使用中文.
 
 格式你的响应为一个JSON对象,包含两个键: "question" 和 "answer".
 "question" 键的值应该为你生成的问问题.
