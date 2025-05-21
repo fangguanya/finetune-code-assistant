@@ -8,6 +8,7 @@ import argparse
 import time
 import re
 import asyncio
+import hashlib
 
 # Global OpenAI client instance, to be configured in main()
 # This avoids re-initializing the client for every API call.
@@ -191,20 +192,10 @@ async def call_openai_api(prompt, model="gpt-3.5-turbo", max_tokens=1500, temper
         await asyncio.sleep(5) # Changed to asyncio.sleep
         return None
 
-async def add_comments_to_code(code_block, language, element_name, element_type, retries=10, model="gpt-3.5-turbo", sft_index: int | None = None, base_output_filename_for_log: str | None = None):
+async def add_comments_to_code(code_block, language, element_name, element_type, model, sft_index, base_output_filename_for_log, max_retries, retry_delay):
     """
     Uses OpenAI API to add comments to a given code block.
     """
-#     prompt = f"""分析下面的 {language} 代码片段,针对 {element_type} named '{element_name}'.
-# 分析其主要功能和关键逻辑.
-# 根据你的分析,生成详细的注释,解释代码的各个部分.
-# 确保注释准确、全面,并且与代码逻辑紧密结合.
-# 注释应该清晰地描述代码的用途、实现方式和关键算法.
-# 一定严格保证输入代码块完整的得到处理并输出.
-# 所有思考和输出使用中文.
-# ``` {language}
-# {code_block}
-# ```"""
     prompt = f"""分析下面的 {language} 代码片段,针对 {element_type} named '{element_name}'.
 分析其主要功能和关键逻辑.
 根据你的分析,生成详细的注释,解释代码的各个部分.
@@ -214,7 +205,7 @@ async def add_comments_to_code(code_block, language, element_name, element_type,
 所有思考和输出使用中文.
 输出只能包含代码本身和相关的注释,剔除其他如:cpp```, json 等格式说明字符
 例如:
-输入：
+输入:
 void SayHello()
 {{
     UE_LOG(LogTemp, Log, TEXT("Hello, World!"));
@@ -230,76 +221,37 @@ void SayHello()
 {code_block}
 """
     
-    log_api_interaction("PROMPT", "add_comments", model, element_name, prompt, sft_index=sft_index, processing_filename=base_output_filename_for_log, attempt_num=1) # Log first attempt
+    # Initial prompt log is done by the first iteration of the loop if attempt == 0
 
-    for attempt in range(retries):
-        print(f"Attempt {attempt + 1}/{retries} to add comments to '{element_name}' (model: {model})...")
+    for attempt in range(max_retries):
+        current_attempt_num = attempt + 1
+        log_purpose = "add_comments" if attempt == 0 else "add_comments_retry"
+        
+        log_api_interaction("PROMPT", log_purpose, model, element_name, prompt, sft_index=sft_index, processing_filename=base_output_filename_for_log, attempt_num=current_attempt_num)
+        
+        print(f"Attempt {current_attempt_num}/{max_retries} to add comments to '{element_name}' (model: {model})...")
         api_response_content = await call_openai_api(prompt, model=model, max_tokens=len(code_block.split()) + 700)
         
-        log_api_interaction("RESPONSE", "add_comments", model, element_name, api_response_content if api_response_content else "<API response was None or empty>", sft_index=sft_index, processing_filename=base_output_filename_for_log, attempt_num=attempt + 1)
+        log_api_interaction("RESPONSE", "add_comments", model, element_name, api_response_content if api_response_content else "<API response was None or empty>", sft_index=sft_index, processing_filename=base_output_filename_for_log, attempt_num=current_attempt_num)
 
-        if api_response_content: # Renamed from commented_code for clarity before processing
+        if api_response_content: 
             return api_response_content.strip()
-            # Basic check to see if the output looks like code (might need refinement)
-            # if "```" in api_response_content: 
-            #     match = re.search(rf"```{language}\s*([\s\S]+?)```|```\s*([\s\S]+?)```", api_response_content, re.DOTALL)
-            #     if match:
-            #         extracted = match.group(1) or match.group(2)
-            #         if extracted:
-            #             original_lines = code_block.splitlines()
-            #             if any(line.strip() in extracted for line in original_lines if line.strip()):
-            #                 return extracted.strip()
-            #             else:
-            #                 print(f"Warning: Commented code for '{element_name}' from API did not seem to retain original code structure after extraction. Output:\n{api_response_content[:300]}...")
-            #     else: 
-            #          print(f"Warning: Commented code for '{element_name}' from API was wrapped in ``` but extraction failed. Output:\n{api_response_content[:300]}...")
-            #          # Fallback to heuristic if extraction fails but ``` was present
-            #          if len(api_response_content) > len(code_block) * 0.5 and any(line.strip() in api_response_content for line in code_block.splitlines() if line.strip() and not line.strip().startswith("//") and not line.strip().startswith("/*")):
-            #              return api_response_content 
-            # elif "{{" in api_response_content or "}}" in api_response_content or "def " in api_response_content or "class " in api_response_content or "void " in api_response_content or "public " in api_response_content : 
-            #      original_lines = code_block.splitlines()
-            #      present_original_lines = sum(1 for line in original_lines if line.strip() and line.strip() in api_response_content)
-            #      if present_original_lines > min(3, len(original_lines) / 2): 
-            #         return api_response_content.strip()
-            #      else:
-            #         print(f"Warning: Commented code for '{element_name}' from API was unwrapped and didn't seem to contain enough original code. Output:\n{api_response_content[:300]}...")
+
+        if current_attempt_num < max_retries:
+            print(f"Failed to get valid commented code for '{element_name}' on attempt {current_attempt_num}/{max_retries}. Retrying after {retry_delay}s delay...")
+            await asyncio.sleep(retry_delay)
+        else:
+            print(f"Error: Could not generate comments for '{element_name}' after {max_retries} retries.")
+            break # Exit loop after max retries
+            
+    return None # Explicitly return None if all retries fail
 
 
-        print(f"Failed to get valid commented code for '{element_name}' on attempt {attempt + 1}. Retrying after delay...")
-        await asyncio.sleep(5 + attempt * 5) # Exponential backoff
-    print(f"Error: Could not generate comments for '{element_name}' after {retries} retries.")
-    return None
-
-
-async def generate_qa_pair(code_block, language, element_name, element_type, retries=3, model="gpt-3.5-turbo", sft_index: int | None = None, base_output_filename_for_log: str | None = None):
+async def generate_qa_pair(code_block, language, element_name, element_type, model, sft_index, base_output_filename_for_log, max_retries, retry_delay):
     """
     Uses OpenAI API to analyze code and generate a question-answer pair.
     The provided code_block will be the answer.
     """
-#     prompt = f"""分析下面的 {language} 代码片段,针对 {element_type} named '{element_name}'.
-# 理解其主要功能和关键逻辑.
-# 根据你的分析,生成一个简洁且相关的问题,这个代码片段有效地回答了这个问题.
-# 问题应该是一个开发人员使用提供的代码时所解决的具体问题.
-# 也就是说,提供的代码块本身将作为你生成问题的答案.
-# 所有思考和输出使用中文.
-
-# 格式你的响应为一个JSON对象,包含两个键: "question" 和 "answer".
-# "question" 键的值应该为你生成的问问题.
-# "answer" 键的值应该为精确的原始代码块.
-
-# 原始代码块:
-# ``` {language}
-# {code_block}
-# ```
-
-# JSON 响应格式示例:
-# {{
-#   "question": "生成的问问题...",
-#   "answer": "精确的原始代码块..."
-# }}
-
-# 确保你的JSON响应中的 "answer" 字段包含精确的原始代码块,不要修改或省略任何代码.
-# """
     prompt = f"""分析下面的 {language} 代码片段,针对 {element_type} named '{element_name}'.
 理解其主要功能和关键逻辑.
 根据你的分析,生成一个简洁且相关的问题,这个代码片段有效地回答了这个问题.
@@ -321,18 +273,22 @@ void SayHello()
 原始代码块:
 {code_block}
 """
-    log_api_interaction("PROMPT", "generate_qa", model, element_name, prompt, sft_index=sft_index, processing_filename=base_output_filename_for_log, attempt_num=1) # Log first attempt
+    # Initial prompt log is done by the first iteration of the loop if attempt == 0
+    
+    for attempt in range(max_retries):
+        current_attempt_num = attempt + 1
+        log_purpose = "generate_qa" if attempt == 0 else "generate_qa_retry"
 
-    for attempt in range(retries):
-        print(f"Attempt {attempt + 1}/{retries} to generate Q&A for '{element_name}' (model: {model})...")
+        log_api_interaction("PROMPT", log_purpose, model, element_name, prompt, sft_index=sft_index, processing_filename=base_output_filename_for_log, attempt_num=current_attempt_num)
+
+        print(f"Attempt {current_attempt_num}/{max_retries} to generate Q&A for '{element_name}' (model: {model})...")
         response_text = await call_openai_api(prompt, model=model, max_tokens=len(code_block.split()) + 400)
 
-        log_api_interaction("RESPONSE", "generate_qa", model, element_name, response_text if response_text else "<API response was None or empty>", sft_index=sft_index, processing_filename=base_output_filename_for_log, attempt_num=attempt + 1)
+        log_api_interaction("RESPONSE", "generate_qa", model, element_name, response_text if response_text else "<API response was None or empty>", sft_index=sft_index, processing_filename=base_output_filename_for_log, attempt_num=current_attempt_num)
 
         if response_text:
             try:
                 processed_response_text = response_text.strip()
-                # Handle potential markdown ```json ... ```
                 if processed_response_text.startswith("```json"):
                     processed_response_text = processed_response_text[7:]
                 if processed_response_text.endswith("```"):
@@ -341,31 +297,18 @@ void SayHello()
                 qa_data = {}
                 qa_data["question"] = processed_response_text.strip()
                 qa_data["answer"] = code_block
-                return qa_data
-                # qa_data = json.loads(processed_response_text.strip())
-                # if isinstance(qa_data, dict) and "question" in qa_data and "answer" in qa_data:
-                #     # More lenient check for the answer, as LLMs might slightly reformat whitespace or comments
-                #     # We mainly care that the core code is there.
-                #     # Simple check: non-empty and significant overlap in non-whitespace characters
-                #     original_condensed = "".join(code_block.split())
-                #     answer_condensed = "".join(str(qa_data["answer"]).split())
-
-                #     if len(answer_condensed) > 0.7 * len(original_condensed) and \
-                #        (original_condensed in answer_condensed or answer_condensed in original_condensed):
-                #         # If LLM reformatted slightly but included original, replace with exact original
-                #         qa_data["answer"] = code_block 
-                #         return qa_data
-                #     else:
-                #         print(f"Warning: Q&A answer for '{element_name}' significantly differs from original. Retrying.")
-                #         # print(f"Original (condensed): {original_condensed[:100]}...")
-                #         # print(f"API Answer (condensed): {answer_condensed[:100]}...")
+                return qa_data 
             except json.JSONDecodeError as e:
                 print(f"Error decoding Q&A JSON for '{element_name}': {e}. Response: {response_text[:200]}...")
         
-        print(f"Failed to get valid Q&A for '{element_name}' on attempt {attempt + 1}. Retrying after delay...")
-        await asyncio.sleep(5 + attempt * 5)
-    print(f"Error: Could not generate Q&A pair for '{element_name}' after {retries} retries.")
-    return None
+        if current_attempt_num < max_retries:
+            print(f"Failed to get valid Q&A for '{element_name}' on attempt {current_attempt_num}/{max_retries}. Retrying after {retry_delay}s delay...")
+            await asyncio.sleep(retry_delay)
+        else:
+            print(f"Error: Could not generate Q&A pair for '{element_name}' after {max_retries} retries.")
+            break # Exit loop after max retries
+
+    return None # Explicitly return None if all retries fail
 
 def format_time(seconds): # Copied from gen_qa.py for ETA display
     """Formats seconds into HH:MM:SS or MM:SS string."""
@@ -378,143 +321,286 @@ def format_time(seconds): # Copied from gen_qa.py for ETA display
     else:
         return f"{minutes:02d}:{secs:02d}"
 
-async def process_items_async(args, sft_data_subset, client_ref): # Added client_ref
-    """Asynchronously processes SFT data items."""
-    global client # Ensure we're referencing the global client if needed, or use client_ref
-    client = client_ref # Assign the passed client to the global one if other functions rely on global client
+# --- Progress Saving/Loading Helper Functions ---
+def calculate_file_hash(filepath):
+    """Calculates SHA256 hash of a file."""
+    sha256_hash = hashlib.sha256()
+    try:
+        with open(filepath, "rb") as f:
+            for byte_block in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(byte_block)
+        return sha256_hash.hexdigest()
+    except FileNotFoundError:
+        # This can happen if sft_input_file is specified incorrectly by user
+        # Or if progress refers to a no-longer-existing sft_input_file path
+        print(f"Warning: File not found for hashing: {filepath}")
+        return None
+    except Exception as e:
+        print(f"Error calculating hash for {filepath}: {e}")
+        return None
 
-    all_qa_pairs = []
-    total_to_process = len(sft_data_subset)
-    processed_count = 0
-    script_start_time = time.time() # This time is from the start of async processing
+def save_progress(progress_filepath, sft_input_filepath, last_processed_sft_index):
+    """Saves the last processed SFT index and a hash of the SFT input file."""
+    sft_input_hash = calculate_file_hash(sft_input_filepath)
+    # If sft_input_hash is None, we still save progress but hash verification will fail on load
+    # if the original sft file issue isn't resolved.
+    
+    progress_data = {
+        "last_processed_sft_index": last_processed_sft_index,
+        "sft_input_file_hash": sft_input_hash,
+        "sft_input_filepath_for_reference": sft_input_filepath # For human readability
+    }
+    try:
+        with open(progress_filepath, 'w', encoding='utf-8') as f:
+            json.dump(progress_data, f, indent=2)
+        # Minor adjustment to log message for clarity
+        print(f"Progress saved: SFT index {last_processed_sft_index} marked as processed. File: {progress_filepath}") 
+    except Exception as e:
+        print(f"Error saving progress to {progress_filepath}: {e}")
 
-    for i_subset, record in enumerate(sft_data_subset):
-        # Calculate original SFT index if needed, sft_data_subset is already the slice
-        original_sft_index = args.start_index + i_subset 
-        item_start_time = time.time()
+def load_progress(progress_filepath, current_sft_input_filepath):
+    """
+    Loads the last processed SFT index if the progress file exists and 
+    the SFT input file hash matches.
+    Returns the last_processed_sft_index or None.
+    """
+    if not os.path.exists(progress_filepath):
+        print(f"No progress file found at {progress_filepath}. Starting fresh or from --start_index.")
+        return None
+    
+    try:
+        with open(progress_filepath, 'r', encoding='utf-8') as f:
+            progress_data = json.load(f)
+    except Exception as e:
+        print(f"Error reading or parsing progress file {progress_filepath}: {e}. Assuming no progress.")
+        # Optionally delete corrupted progress file: os.remove(progress_filepath)
+        return None
         
-        print(f"--- Processing item {processed_count + 1}/{total_to_process} (SFT index: {original_sft_index}) ---")
+    last_processed_sft_index = progress_data.get("last_processed_sft_index")
+    stored_sft_hash = progress_data.get("sft_input_file_hash")
+
+    if last_processed_sft_index is None: # stored_sft_hash can be None if initial save had issues with hashing sft file
+        print(f"Progress file {progress_filepath} is incomplete (missing last_processed_sft_index). Ignoring progress.")
+        return None
+
+    # If stored_sft_hash is None from a previous save attempt where sft_input_file was unhashable,
+    # we cannot verify. Treat as mismatch / ignore progress.
+    if stored_sft_hash is None:
+        print(f"Progress file {progress_filepath} has no SFT file hash. Cannot verify. Ignoring progress.")
+        return None
+
+    current_sft_hash = calculate_file_hash(current_sft_input_filepath)
+    if current_sft_hash is None:
+        print(f"Warning: Could not calculate hash for current SFT input {current_sft_input_filepath}. Cannot verify progress integrity. Ignoring saved progress.")
+        return None
+
+    if stored_sft_hash == current_sft_hash:
+        print(f"Successfully loaded progress: Last processed SFT index {last_processed_sft_index} from {progress_filepath} (SFT content verified). Next item to process will be index {int(last_processed_sft_index) + 1}.")
+        return int(last_processed_sft_index) # Ensure it's an int
+    else:
+        print(f"SFT input file {current_sft_input_filepath} has changed since last progress save (hash mismatch with {progress_data.get('sft_input_filepath_for_reference', 'N/A')}). Ignoring progress from {progress_filepath}.")
+        return None
+
+async def process_single_item_async(semaphore, args, record, item_index_in_batch, client_ref, batch_start_sft_index, sft_input_filepath_for_hash, progress_filepath, progress_state):
+    """Processes a single SFT item asynchronously, respecting the semaphore."""
+    global client
+    client = client_ref # Ensure client is set for this task context if needed globally by helpers
+    
+    original_sft_index = batch_start_sft_index + item_index_in_batch
+    item_start_time = time.time()
+    qa_pair_result = None
+    status_msg = "Error" # Default status
+
+    async with semaphore:
+        print(f"--- Starting processing for SFT index: {original_sft_index} (Batch item: {item_index_in_batch + 1}) ---")
         
         code_block = record.get("code_block")
         language = record.get("language", "unknown")
         element_name = record.get("name", f"element_{original_sft_index}")
         element_type = record.get("type", "unknown_type")
 
-        if not code_block:
-            print(f"Warning: No code_block found for item at SFT index {original_sft_index}. Skipping.")
-            processed_count += 1
-            item_duration = time.time() - item_start_time
-            elapsed_total_time = time.time() - script_start_time
-            avg_time_per_item_so_far = elapsed_total_time / processed_count if processed_count > 0 else 0
-            remaining_items_for_eta = total_to_process - processed_count
-            eta = remaining_items_for_eta * avg_time_per_item_so_far if avg_time_per_item_so_far > 0 and remaining_items_for_eta > 0 else 0
-            print(f"Finished item {processed_count}/{total_to_process} (SFT idx: {original_sft_index}, Status: NoCodeBlock) in {item_duration:.2f}s. ETA: {format_time(eta)}")
-            print("-" * 40)
-            continue
-
         # Determine the base output filename (e.g., 0_MyFunc.cpp or 1_MyClass.cs)
-        # This will be used for logging consistency.
         clean_name_for_file = sanitize_filename(element_name)
         base_name_part = f"{original_sft_index}_{clean_name_for_file}"
-        
-        # Attempt to use original extension or language-based extension for the root name
-        output_filename_root_for_logging_and_base = base_name_part # Default if no extension logic applies
+        output_filename_root_for_logging_and_base = base_name_part
         original_file_path_val_for_ext = record.get("file_path")
+
         if original_file_path_val_for_ext:
             original_ext = os.path.splitext(original_file_path_val_for_ext)[1]
             if original_ext and original_ext.lower() in ['.cpp', '.h', '.hpp', '.c', '.cc', '.cs']:
                 output_filename_root_for_logging_and_base = base_name_part + original_ext
-            # If original_ext is not a recognized code one, try language (but prioritize original if valid)
             elif language == "cpp": output_filename_root_for_logging_and_base = base_name_part + ".cpp"
             elif language == "csharp": output_filename_root_for_logging_and_base = base_name_part + ".cs"
-        elif language == "cpp": # No original_file_path, use language
-            output_filename_root_for_logging_and_base = base_name_part + ".cpp"
-        elif language == "csharp":
-            output_filename_root_for_logging_and_base = base_name_part + ".cs"
-        # At this point, output_filename_root_for_logging_and_base is our unified name for logs
+        elif language == "cpp": output_filename_root_for_logging_and_base = base_name_part + ".cpp"
+        elif language == "csharp": output_filename_root_for_logging_and_base = base_name_part + ".cs"
 
-        print(f"Step 1: Adding comments to '{element_name}' ({language})...")
-        commented_code = await add_comments_to_code(code_block, language, element_name, element_type, model=args.model_comment, sft_index=original_sft_index, base_output_filename_for_log=output_filename_root_for_logging_and_base)
-        
-        commenting_succeeded = False
-        # commented_file_base_name_for_qa was previously output_filename_root, now we use output_filename_root_for_logging_and_base for its role as a base
-
-        if commented_code:
-            # The actual output filename for the .txt file still uses output_filename_root_for_logging_and_base and adds .txt
-            output_filename_with_txt = output_filename_root_for_logging_and_base + ".txt"
-            commented_file_path = os.path.join(args.commented_code_dir, output_filename_with_txt)
-            try:
-                with open(commented_file_path, 'w', encoding='utf-8') as f_out:
-                    f_out.write(commented_code)
-                print(f"Successfully saved commented code to: {commented_file_path}")
-                commenting_succeeded = True
-            except Exception as e:
-                print(f"Error saving commented code for '{element_name}' to {commented_file_path}: {e}")
-                log_api_interaction(
-                    direction="ERROR", 
-                    purpose="save_commented_code_failure", 
-                    model=args.model_comment, 
-                    element_name=element_name, 
-                    content=str(e),
-                    sft_index=original_sft_index,
-                    processing_filename=output_filename_root_for_logging_and_base, # Unified name
-                    attempt_num=None
-                )
-        
-        if not commenting_succeeded:
-            print(f"Skipping Q&A generation for '{element_name}' as commenting failed or produced no code.")
-
-        qa_generated_successfully = False
-        if commenting_succeeded:
-            print(f"Step 2: Generating Q&A for '{element_name}' using original code...")
-            qa_pair = await generate_qa_pair(code_block, language, element_name, element_type, model=args.model_qa, sft_index=original_sft_index, base_output_filename_for_log=output_filename_root_for_logging_and_base)
+        if not code_block:
+            print(f"Warning: No code_block found for item at SFT index {original_sft_index}. Skipping.")
+            status_msg = "NoCodeBlock"
+        else:
+            # Step 1: Add comments
+            print(f"SFT Index {original_sft_index}: Step 1 - Adding comments to '{element_name}' ({language})...")
+            commented_code = await add_comments_to_code(code_block, language, element_name, element_type, model=args.model_comment, sft_index=original_sft_index, base_output_filename_for_log=output_filename_root_for_logging_and_base, max_retries=args.max_api_retries, retry_delay=args.api_retry_delay)
             
-            if qa_pair:
-                qa_pair["original_sft_index"] = original_sft_index
-                qa_pair["element_name"] = element_name
-                qa_pair["language"] = language
-                qa_pair["source_file"] = record.get("file_path", "N/A")
-                all_qa_pairs.append(qa_pair)
-                print(f"Successfully generated Q&A for '{element_name}'.")
-                qa_generated_successfully = True
-
-                if args.individual_qa_dir and output_filename_root_for_logging_and_base: # Check new root name
-                    individual_qa_filename = f"{output_filename_root_for_logging_and_base}.json"
-                    individual_qa_filepath = os.path.join(args.individual_qa_dir, individual_qa_filename)
-                    try:
-                        with open(individual_qa_filepath, 'w', encoding='utf-8') as f_ind_qa:
-                            json.dump(qa_pair, f_ind_qa, indent=2, ensure_ascii=False)
-                        print(f"Successfully saved individual Q&A to: {individual_qa_filepath}")
-                    except Exception as e:
-                        print(f"Error saving individual Q&A file {individual_qa_filepath}: {e}")
-                        log_api_interaction(
-                            direction="ERROR", 
-                            purpose="save_individual_qa_failure", 
-                            model=args.model_qa, 
-                            element_name=element_name, 
-                            content=str(e),
-                            sft_index=original_sft_index,
-                            processing_filename=output_filename_root_for_logging_and_base, # Unified name
-                            attempt_num=None
-                        )
+            commenting_succeeded = False
+            if commented_code:
+                output_filename_with_txt = output_filename_root_for_logging_and_base + ".txt"
+                commented_file_path = os.path.join(args.commented_code_dir, output_filename_with_txt)
+                try:
+                    with open(commented_file_path, 'w', encoding='utf-8') as f_out:
+                        f_out.write(commented_code)
+                    print(f"SFT Index {original_sft_index}: Successfully saved commented code to: {commented_file_path}")
+                    commenting_succeeded = True
+                except Exception as e:
+                    print(f"SFT Index {original_sft_index}: Error saving commented code for '{element_name}' to {commented_file_path}: {e}")
+                    log_api_interaction("ERROR", "save_commented_code_failure", args.model_comment, element_name, str(e), original_sft_index, output_filename_root_for_logging_and_base, None)
+            
+            if not commenting_succeeded:
+                print(f"SFT Index {original_sft_index}: Skipping Q&A generation for '{element_name}' as commenting failed or produced no code.")
+                status_msg = "CommentFail"
             else:
-                print(f"Failed to generate Q&A for '{element_name}'.")
-        
-        processed_count += 1
-        item_duration = time.time() - item_start_time
-        elapsed_total_time = time.time() - script_start_time
-        avg_time_per_item = elapsed_total_time / processed_count if processed_count > 0 else 0
-        remaining_items = total_to_process - processed_count
-        eta = remaining_items * avg_time_per_item if avg_time_per_item > 0 and remaining_items > 0 else 0
-        
-        status_msg = "OK"
-        if not commenting_succeeded: status_msg = "CommentFail"
-        elif not qa_generated_successfully: status_msg = "QAFail"
+                # Step 2: Generate Q&A pair
+                print(f"SFT Index {original_sft_index}: Step 2 - Generating Q&A for '{element_name}' using original code...")
+                qa_pair = await generate_qa_pair(code_block, language, element_name, element_type, model=args.model_qa, sft_index=original_sft_index, base_output_filename_for_log=output_filename_root_for_logging_and_base, max_retries=args.max_api_retries, retry_delay=args.api_retry_delay)
+                
+                if qa_pair:
+                    qa_pair["original_sft_index"] = original_sft_index
+                    qa_pair["element_name"] = element_name
+                    qa_pair["language"] = language
+                    qa_pair["source_file"] = record.get("file_path", "N/A")
+                    qa_pair_result = qa_pair 
+                    print(f"SFT Index {original_sft_index}: Successfully generated Q&A for '{element_name}'.")
+                    status_msg = "OK"
 
-        print(f"Finished item {processed_count}/{total_to_process} (SFT idx: {original_sft_index}, Status: {status_msg}) in {item_duration:.2f}s. ETA: {format_time(eta)}")
-        print("-" * 40)
-    
-    return all_qa_pairs # Return the collected Q&A pairs
+                    if args.individual_qa_dir:
+                        individual_qa_filename = f"{output_filename_root_for_logging_and_base}.json"
+                        individual_qa_filepath = os.path.join(args.individual_qa_dir, individual_qa_filename)
+                        try:
+                            with open(individual_qa_filepath, 'w', encoding='utf-8') as f_ind_qa:
+                                json.dump(qa_pair, f_ind_qa, indent=2, ensure_ascii=False)
+                            print(f"SFT Index {original_sft_index}: Successfully saved individual Q&A to: {individual_qa_filepath}")
+                        except Exception as e:
+                            print(f"SFT Index {original_sft_index}: Error saving individual Q&A file {individual_qa_filepath}: {e}")
+                            log_api_interaction("ERROR", "save_individual_qa_failure", args.model_qa, element_name, str(e), original_sft_index, output_filename_root_for_logging_and_base, None)
+                            status_msg = "QASaveFail" 
+                else:
+                    print(f"SFT Index {original_sft_index}: Failed to generate Q&A for '{element_name}'.")
+                    status_msg = "QAFail"
+
+        item_duration = time.time() - item_start_time
+        print(f"--- Finished processing for SFT index: {original_sft_index} (Status: {status_msg}) in {item_duration:.2f}s ---")
+
+        async with progress_state["lock"]:
+            progress_state["item_statuses"][original_sft_index] = status_msg
+            
+            if status_msg == "OK" or status_msg == "NoCodeBlock":
+                # Try to advance the contiguous progress counter
+                new_advanced_idx = progress_state["current_max_saved_idx"]
+                idx_to_check = progress_state["current_max_saved_idx"] + 1
+                while True:
+                    current_item_status = progress_state["item_statuses"].get(idx_to_check)
+                    if current_item_status == "OK" or current_item_status == "NoCodeBlock":
+                        new_advanced_idx = idx_to_check
+                        idx_to_check += 1
+                    else:
+                        break # Gap found or item not yet processed
+                
+                if new_advanced_idx > progress_state["current_max_saved_idx"]:
+                    progress_state["current_max_saved_idx"] = new_advanced_idx
+                    save_progress(progress_filepath, sft_input_filepath_for_hash, new_advanced_idx)
+                    print(f"Progress advanced by single item logic to SFT index: {new_advanced_idx}. Item {original_sft_index} triggered check.")
+        
+        return {
+            "original_sft_index": original_sft_index,
+            "qa_pair": qa_pair_result,
+            "status": status_msg
+        }
+
+async def process_items_async(args, sft_data_subset, client_ref, progress_filepath, sft_input_filepath_for_hash, batch_start_sft_index, progress_state):
+    """Asynchronously processes SFT data items in a batch with concurrency control."""
+    global client 
+    client = client_ref
+
+    all_qa_pairs_for_this_batch = []
+    tasks = []
+    semaphore = asyncio.Semaphore(args.concurrency_limit)
+    print(f"Batch processing starting from SFT index {batch_start_sft_index} with concurrency limit {args.concurrency_limit}. Initial saved progress index: {progress_state['current_max_saved_idx']}")
+
+    for i_batch, record_in_batch in enumerate(sft_data_subset):
+        # `process_single_item_async` now handles its own printouts for start/finish
+        # It also calculates original_sft_index internally based on batch_start_sft_index and i_batch
+        tasks.append(process_single_item_async(semaphore, args, record_in_batch, i_batch, client_ref, batch_start_sft_index, sft_input_filepath_for_hash, progress_filepath, progress_state))
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Process results and determine progress
+    processed_item_details = []
+    for i_batch, result_or_exc in enumerate(results):
+        original_sft_idx_for_result = batch_start_sft_index + i_batch # Calculate again for safety/mapping
+        if isinstance(result_or_exc, Exception):
+            print(f"Error processing SFT index {original_sft_idx_for_result}: An exception occurred during its task: {result_or_exc}")
+            # Log this critical failure? Perhaps at a higher level or specific log file.
+            # For now, treat as a processing failure for progress calculation.
+            processed_item_details.append({
+                "original_sft_index": original_sft_idx_for_result,
+                "status": "TaskException", # Special status for unhandled exceptions in task
+                "qa_pair": None
+            })
+        else: # This is the dictionary returned by process_single_item_async
+            processed_item_details.append(result_or_exc)
+            if result_or_exc.get("qa_pair"):
+                all_qa_pairs_for_this_batch.append(result_or_exc["qa_pair"])
+
+    # Sort results by original SFT index to correctly determine consecutive success for progress saving
+    processed_item_details.sort(key=lambda x: x["original_sft_index"])
+
+    # If the first item in the batch was not successfully processed, we don't update progress based on this batch.
+    # The progress file should reflect the highest index *before* this batch started if this batch had failures at the start.
+    # However, our save_progress will overwrite. So we must be careful.
+    # Let's assume progress is saved if *any* item in the current batch (from its start) is processed successfully.
+    # The crucial part is finding the *highest consecutive* successful index *within this batch processing run*, starting from batch_start_sft_index.
+
+    current_batch_last_good_sft_idx = -1 # Tracks the last good SFT index *within this batch processing*
+
+    for detail in processed_item_details:
+        # detail["original_sft_index"] is absolute
+        # We are checking for an uninterrupted sequence of OK/NoCodeBlock from batch_start_sft_index
+        if detail["original_sft_index"] == batch_start_sft_index + (detail["original_sft_index"] - batch_start_sft_index): # a bit redundant, just ensuring we are in sequence
+            if detail["status"] == "OK" or detail["status"] == "NoCodeBlock":
+                current_batch_last_good_sft_idx = detail["original_sft_index"]
+            else:
+                # First failure in the sequence from the start of the batch, stop advancing progress for this batch.
+                break 
+        else:
+            # This case should not happen if processed_item_details is sorted and covers the contiguous batch block.
+            print(f"Warning: Discontinuity in processed item SFT indexes. Expected {batch_start_sft_index + len(processed_item_details) -1}, got {detail['original_sft_index']}. Progress saving might be conservative.")
+            break
+            
+    if current_batch_last_good_sft_idx != -1:
+        print(f"Batch processing complete. Last consecutively successful SFT index in this batch run: {current_batch_last_good_sft_idx}.")
+        async with progress_state["lock"]:
+            if current_batch_last_good_sft_idx > progress_state["current_max_saved_idx"]:
+                save_progress(progress_filepath, sft_input_filepath_for_hash, current_batch_last_good_sft_idx)
+                progress_state["current_max_saved_idx"] = current_batch_last_good_sft_idx
+                print(f"Shared progress tracker updated by batch-end save to: {current_batch_last_good_sft_idx}")
+            elif current_batch_last_good_sft_idx == progress_state["current_max_saved_idx"]:
+                 print(f"Batch-end save: SFT index {current_batch_last_good_sft_idx} consistent with current tracker. File likely saved by single item or previous batch. No state change needed based on batch check.")
+            else: # current_batch_last_good_sft_idx < progress_state["current_max_saved_idx"]
+                 print(f"Batch-end save: Calculated batch SFT index {current_batch_last_good_sft_idx} is behind current tracker ({progress_state['current_max_saved_idx']}). Tracker already reflects more progress. No state change needed based on batch check.")
+    else:
+        # This means the very first item attempted in this batch (or all items) failed or had an exception.
+        # In this case, we do *not* update the progress file from the batch-end logic, as it would either:
+        #   a) incorrectly mark an earlier index (if we tried to do current_batch_last_good_sft_idx -1), or
+        #   b) reflect no progress for this batch run, which is correct.
+        # The existing progress file (if any, from a previous run or a prior successful batch in a long run) remains untouched by this specific batch's failure.
+        print(f"Batch processing encountered failures at the beginning or throughout. Progress file not updated for this batch based on SFT index {batch_start_sft_index}. Prior progress (if any) is preserved.")
+
+    total_items_in_batch = len(sft_data_subset)
+    successful_items_in_batch = sum(1 for r in processed_item_details if r["status"] == "OK" or r["status"] == "NoCodeBlock")
+    print(f"Batch Summary: Processed {total_items_in_batch} items. {successful_items_in_batch} succeeded or were skipped (NoCodeBlock). {len(all_qa_pairs_for_this_batch)} Q&A pairs generated from this batch.")
+    print("-" * 50)
+
+    return all_qa_pairs_for_this_batch
 
 # --- Main Script Logic ---
 def main():
@@ -536,7 +622,11 @@ def main():
     parser.add_argument("--model_qa", type=str, default="qwen2.5-local", help="Model name to use for generating Q&A pairs (e.g., gpt-3.5-turbo, or your local model's identifier).")
     
     parser.add_argument("--max_items", type=int, default=None, help="Maximum number of items to process from the SFT dataset (for testing).")
-    parser.add_argument("--start_index", type=int, default=0, help="Index to start processing from in the SFT dataset (for resuming).")
+    parser.add_argument("--start_index", type=int, default=0, help="Index to start processing from in the SFT dataset (for resuming or partial processing).")
+    parser.add_argument("--progress_file", type=str, default="sft_processing_progress.json", help="Path to the progress file for saving and resuming state. Default: sft_processing_progress.json")
+    parser.add_argument("--concurrency_limit", type=int, default=5, help="Maximum number of SFT items to process concurrently. Default: 5")
+    parser.add_argument("--max_api_retries", type=int, default=100, help="Maximum number of retries for a failing API call step. Default: 100")
+    parser.add_argument("--api_retry_delay", type=int, default=10, help="Delay in seconds between API call retries. Default: 10")
 
     args = parser.parse_args()
 
@@ -589,7 +679,7 @@ def main():
         os.makedirs(args.individual_qa_dir)
         print(f"Created directory for individual Q&A files: {args.individual_qa_dir}")
 
-    # 1. Read SFT data
+    # Load SFT data
     try:
         with open(args.sft_input_file, 'r', encoding='utf-8') as f:
             sft_data = json.load(f)
@@ -597,25 +687,50 @@ def main():
         print(f"Error reading or parsing SFT input file {args.sft_input_file}: {e}")
         return
 
-    # all_qa_pairs will be populated by the async function
-    # total_to_process, processed_count, script_start_time are now managed within process_items_async
+    # Determine effective start index based on progress file and --start_index argument
+    loaded_sft_idx = load_progress(args.progress_file, args.sft_input_file)
+    
+    effective_start_index = args.start_index # User's explicit start_index is the baseline
+    initial_tracker_value = -1 # Default if no progress loaded
+    if loaded_sft_idx is not None:
+        # If progress was loaded, resume from the item AFTER the last processed one.
+        # And ensure we don't go back if args.start_index was manually set further ahead.
+        effective_start_index = max(args.start_index, loaded_sft_idx + 1)
+        initial_tracker_value = loaded_sft_idx
+        if effective_start_index > loaded_sft_idx + 1 and args.start_index <= loaded_sft_idx + 1 :
+             print(f"Resuming from SFT index {effective_start_index} based on progress file, overriding --start_index {args.start_index} as it was behind.")
+        elif effective_start_index == args.start_index and args.start_index > loaded_sft_idx + 1:
+             print(f"Starting from SFT index {effective_start_index} as specified by --start_index, which is ahead of saved progress.")
+        elif effective_start_index == loaded_sft_idx + 1:
+             print(f"Resuming from SFT index {effective_start_index} based on progress file.")
+    else:
+        print(f"No valid progress loaded. Starting from SFT index {effective_start_index} (based on --start_index or default 0).")
 
-    start_idx = args.start_index
+    progress_state = {
+        "lock": asyncio.Lock(),
+        "current_max_saved_idx": initial_tracker_value,
+        "item_statuses": {} # Stores SFT_index: status_msg for items processed in current run
+    }
+    # Adjust slicing based on effective_start_index
+    start_idx = effective_start_index 
     end_idx = len(sft_data)
     if args.max_items is not None:
+        # max_items is relative to the effective_start_index
         end_idx = min(start_idx + args.max_items, len(sft_data))
 
-    if start_idx >= len(sft_data):
-        print(f"Start index {start_idx} is out of bounds for SFT data of length {len(sft_data)}.")
+    if start_idx >= len(sft_data) and len(sft_data) > 0:
+        print(f"Effective start index {start_idx} is at or beyond the end of SFT data (length {len(sft_data)}). Nothing to process.")
         return
+    if start_idx >= end_idx:
+         print(f"Effective start index {start_idx} is not less than end index {end_idx}. Nothing to process.")
+         return
         
-    print(f"Processing items from index {start_idx} to {end_idx -1} using comment model '{args.model_comment}' and Q&A model '{args.model_qa}'.")
+    print(f"Effective processing range: SFT index {start_idx} to {end_idx -1}.")
 
     sft_data_to_process = sft_data[start_idx:end_idx]
     
     # Run the asynchronous processing
-    # Pass the initialized client to the async function
-    all_qa_pairs_results = asyncio.run(process_items_async(args, sft_data_to_process, client))
+    all_qa_pairs_results = asyncio.run(process_items_async(args, sft_data_to_process, client, args.progress_file, args.sft_input_file, start_idx, progress_state))
 
     # Save all Q&A pairs (results from async processing)
     try:
